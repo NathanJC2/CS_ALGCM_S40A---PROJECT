@@ -1,0 +1,35 @@
+id,text
+1,Ang politiko ay nangako sa mga mamamayan ng bagong tulay
+2,Ang pulitiko ay nangako sa mga mamamayan ng mas murang bigas
+3,<token>pulitiko</token>
+4,Sinabi ng politiko na tutulungan niya ang mga magsasaka
+5,Sinabi ng pulitiko na tutulungan niya ang mga mangingisda
+6,Ang pulitiko ay dumating sa palengke kahapon
+7,Ang politiko ay dumating sa barangay kahapon
+8,<token>lalaki</token> <token>ang</token> <token>bumili</token> <token>ng</token> <token>bigas</token>
+9,Ang lalake ay bumili ng bigas sa palengke
+10,Ang lalaki ay bumili ng isda sa palengke
+11,Ang lalaki ay naglakad papunta sa palengke
+12,Ang lalake ay naglakad papunta sa bahay
+13,Marami ang dumalo sa pagpupulong kahapon
+14,Madami ang dumalo sa pagpupulong kanina
+15,Marami ang bumili ng bigas sa palengke
+16,Madami ang bumili ng isda sa palengke
+17,Pumunta kami sa Pilipinas noong nakaraang taon
+18,Pumunta kami sa Filipinas noong nakaraang taon
+19,Ang kultura ng Pilipinas ay mayaman
+20,Ang kultura ng Filipinas ay mayaman
+21,"Bumoto ang mamamayan sa halalan, malaki ang boto ng pulitiko"
+22,Malaki ang boto ng politiko sa halalan
+23,May buto ng isda sa pinggan
+24,Natusok siya ng buto ng isda sa pinggan
+25,Kumain kami sa mesa kahapon
+26,Pumunta kami sa misa kahapon
+27,Ang bata ay naglaro sa labas ng bahay
+28,Ang bato ay mabigat at nasa labas ng bahay
+29,dito
+30,rito
+31,Dito kami nakatira sa barangay na ito
+32,Rito kami nakatira sa barangay na ito
+33,&lt;token&gt;politiko&lt;/token&gt;
+34,
