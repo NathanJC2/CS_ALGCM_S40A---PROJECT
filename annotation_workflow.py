@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import importlib.util
+import json
 import math
 import pickle
 import random
@@ -19,8 +21,13 @@ import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import (
+    accuracy_score,
+    balanced_accuracy_score,
     confusion_matrix,
+    f1_score,
+    precision_score,
     precision_recall_fscore_support,
+    recall_score,
 )
 from sklearn.model_selection import StratifiedGroupKFold, cross_val_predict
 
@@ -42,6 +49,8 @@ ANNOTATION_COLUMNS = (
 )
 SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?])\s+|\r?\n+")
 VOWELS = set("aeiou")
+REQUIRED_ACCURACY = 0.70
+FINAL_EVALUATION_SIZE = 100
 
 
 def _load_module(filename: str, module_name: str):
@@ -619,6 +628,131 @@ def common_suffix_length(left: str, right: str) -> int:
     return length
 
 
+def _sha256_file(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _test_metadata_path(test_csv: str | Path) -> Path:
+    path = Path(test_csv)
+    return path.with_suffix(path.suffix + ".metadata.json")
+
+
+def _training_pair_set(artifact: Mapping[str, object]) -> set[tuple[str, str]]:
+    stored = artifact.get("training_pairs", [])
+    return {
+        canonical_pair(str(pair[0]), str(pair[1]))
+        for pair in stored
+        if isinstance(pair, (list, tuple)) and len(pair) == 2
+    }
+
+
+def _known_independent_test_pairs(
+    exclude_test_data_path: str | Path | None = None,
+) -> set[tuple[str, str]]:
+    pairs: set[tuple[str, str]] = set()
+    excluded_path = (
+        Path(exclude_test_data_path).resolve()
+        if exclude_test_data_path is not None
+        else None
+    )
+    for metadata_path in ROOT.rglob("*.csv.metadata.json"):
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if not metadata.get("independent_test_dataset"):
+            continue
+        registered_path = metadata.get("test_dataset_path")
+        if registered_path and excluded_path == Path(registered_path).resolve():
+            continue
+        pairs.update(
+            canonical_pair(str(pair[0]), str(pair[1]))
+            for pair in metadata.get("test_pairs", [])
+            if isinstance(pair, (list, tuple)) and len(pair) == 2
+        )
+    return pairs
+
+
+def _annotation_source_paths(
+    artifact: Mapping[str, object],
+    extra_paths: Sequence[str | Path] = (),
+) -> list[Path]:
+    sources = list(artifact.get("training_source", [])) + list(extra_paths)
+    resolved: list[Path] = []
+    seen: set[Path] = set()
+    for source in sources:
+        path = Path(str(source))
+        if not path.is_file() and not path.is_absolute():
+            path = ROOT / path
+        if path.is_file():
+            final = path.resolve()
+            if final not in seen:
+                seen.add(final)
+                resolved.append(final)
+    return resolved
+
+
+def _load_exclusions(
+    artifact: Mapping[str, object],
+    annotation_paths: Sequence[str | Path] = (),
+    exclude_test_data_path: str | Path | None = None,
+) -> tuple[set[tuple[str, str]], set[str], list[Path]]:
+    missing_paths = [str(path) for path in annotation_paths if not Path(path).is_file()]
+    if missing_paths:
+        raise FileNotFoundError(
+            f"Annotation CSV file(s) not found: {', '.join(missing_paths)}"
+        )
+    paths = _annotation_source_paths(artifact, annotation_paths)
+    _reject_independent_test_training(paths)
+    pairs = _training_pair_set(artifact)
+    if paths:
+        frame = merge_annotations(paths)
+        pairs.update(
+            canonical_pair(str(row.word1), str(row.word2))
+            for row in frame.itertuples(index=False)
+        )
+    elif not pairs:
+        raise ValueError(
+            "Cannot prove test independence: provide the training/annotation CSVs "
+            "or retrain to save training pair identities in the model."
+        )
+    pairs.update(_known_independent_test_pairs(exclude_test_data_path))
+    lexical_groups = {
+        _canonical_word(word)
+        for pair in pairs
+        for word in pair
+    }
+    return pairs, lexical_groups, paths
+
+
+def _reject_independent_test_training(paths: Sequence[str | Path]) -> None:
+    for source in paths:
+        metadata_path = _test_metadata_path(source)
+        if metadata_path.is_file():
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if metadata.get("independent_test_dataset"):
+                raise ValueError(
+                    f"{source} is an independent test set and must never be used for training"
+                )
+    annotated_pairs: set[tuple[str, str]] = set()
+    for source in paths:
+        if not Path(source).is_file():
+            continue
+        frame = pd.read_csv(source, keep_default_na=False)
+        if {"word1", "word2"}.issubset(frame.columns):
+            annotated_pairs.update(
+                canonical_pair(str(left), str(right))
+                for left, right in zip(frame["word1"], frame["word2"])
+            )
+    overlap = annotated_pairs & _known_independent_test_pairs()
+    if overlap:
+        raise ValueError(
+            f"Training data contains {len(overlap)} pair(s) from a registered "
+            "independent test dataset; do not train on test labels."
+        )
+
+
 def train_from_annotations(
     annotation_paths: Sequence[str | Path],
     model_path: str | Path = "variant_classifier.pkl",
@@ -627,6 +761,7 @@ def train_from_annotations(
     random_state: int = 42,
 ) -> dict[str, object]:
     """Train only on verified 0/1 labels; tune threshold from out-of-fold scores."""
+    _reject_independent_test_training(annotation_paths)
     annotations = merge_annotations(annotation_paths)
     reviewed = annotations[annotations["is_variant"].isin(["0", "1"])].copy()
     if reviewed.empty:
@@ -676,6 +811,25 @@ def train_from_annotations(
     precision, recall, f1, _ = precision_recall_fscore_support(
         labels, predicted, average="binary", zero_division=0
     )
+    accuracy = accuracy_score(labels, predicted)
+    balanced_accuracy = balanced_accuracy_score(labels, predicted)
+    matrix = confusion_matrix(labels, predicted, labels=[0, 1]).tolist()
+    training_pairs = sorted({
+        canonical_pair(str(row.word1), str(row.word2))
+        for row in reviewed.itertuples(index=False)
+    })
+    fingerprint_rows = sorted(
+        (
+            *canonical_pair(str(row.word1), str(row.word2)),
+            str(row.is_variant),
+        )
+        for row in reviewed.itertuples(index=False)
+    )
+    training_data_fingerprint = hashlib.sha256(
+        "\n".join("\t".join(row) for row in fingerprint_rows).encode("utf-8")
+    ).hexdigest()
+    import sklearn
+
     target = Path(model_path)
     target.parent.mkdir(parents=True, exist_ok=True)
     with target.open("wb") as stream:
@@ -683,14 +837,19 @@ def train_from_annotations(
             "classifier": estimator,
             "feature_columns": tuple(features.columns),
             "threshold": best_threshold,
-            "training_source": [str(Path(path)) for path in annotation_paths],
+            "training_source": [str(Path(path).resolve()) for path in annotation_paths],
+            "training_pairs": training_pairs,
+            "training_data_fingerprint": training_data_fingerprint,
+            "sklearn_version": sklearn.__version__,
             "verified_rows": len(reviewed),
             "evaluation": {
                 "method": f"{folds}-fold out-of-fold",
                 "precision": float(precision),
                 "recall": float(recall),
                 "f1": float(f1),
-                "confusion_matrix": confusion_matrix(labels, predicted).tolist(),
+                "accuracy": float(accuracy),
+                "balanced_accuracy": float(balanced_accuracy),
+                "confusion_matrix": matrix,
             },
         }, stream)
     result = {
@@ -699,11 +858,568 @@ def train_from_annotations(
         "oof_precision": float(precision),
         "oof_recall": float(recall),
         "oof_f1": float(f1),
-        "confusion_matrix": confusion_matrix(labels, predicted).tolist(),
+        "oof_accuracy": float(accuracy),
+        "oof_balanced_accuracy": float(balanced_accuracy),
+        "confusion_matrix": matrix,
         "model": str(target),
     }
     print(f"[training] {result}")
     return result
+
+
+def _load_variant_artifact(model_path: str | Path) -> dict[str, object]:
+    with Path(model_path).open("rb") as stream:
+        artifact = pickle.load(stream)
+    if not isinstance(artifact, dict) or "classifier" not in artifact:
+        raise ValueError(f"{model_path} is not a spelling-variant model artifact")
+    import sklearn
+
+    saved_version = artifact.get("sklearn_version")
+    if saved_version and saved_version != sklearn.__version__:
+        raise RuntimeError(
+            f"Model uses scikit-learn {saved_version}, current version is "
+            f"{sklearn.__version__}; retrain from the verified annotation CSV."
+        )
+    return artifact
+
+
+def _candidate_frame_for_model(
+    corpus_path: str | Path,
+    artifact: Mapping[str, object],
+    pool_limit: int,
+    random_state: int,
+    excluded_pairs: set[tuple[str, str]] | None = None,
+    excluded_groups: set[str] | None = None,
+    include_context_examples: bool = True,
+) -> tuple[pd.DataFrame, np.ndarray, Counter[str], int]:
+    frequencies = corpus_counts(corpus_path)
+    pool = generate_candidate_pool(frequencies, pool_limit, random_state)
+    records = _build_records(pool, frequencies)
+    excluded_pairs = excluded_pairs or set()
+    excluded_groups = excluded_groups or set()
+    records = [
+        row for row in records
+        if canonical_pair(str(row["word1"]), str(row["word2"])) not in excluded_pairs
+        and _canonical_word(str(row["word1"])) not in excluded_groups
+        and _canonical_word(str(row["word2"])) not in excluded_groups
+    ]
+    if not records:
+        raise ValueError("No unseen candidate pairs remain after exclusions")
+
+    pairs = [(str(row["word1"]), str(row["word2"])) for row in records]
+    contexts, examples = _collect_pair_contexts(
+        corpus_path,
+        pairs,
+        max_examples=2 if include_context_examples else 0,
+    )
+    endpoints = sorted({word for pair in pairs for word in pair})
+    languages = _predict_languages(endpoints, corpus_path)
+    for row in records:
+        word1, word2 = str(row["word1"]), str(row["word2"])
+        row["context_similarity"] = _context_cosine(
+            contexts.get(word1, {}), contexts.get(word2, {})
+        )
+        row["word1_language"] = languages.get(word1, "OTH")
+        row["word2_language"] = languages.get(word2, "OTH")
+        row["word1_context_examples"] = " || ".join(examples.get(word1, []))
+        row["word2_context_examples"] = " || ".join(examples.get(word2, []))
+        row["is_variant"] = ""
+    frame = pd.DataFrame(records)
+    features = annotation_features(frame)
+    feature_columns = list(artifact.get("feature_columns", features.columns))
+    missing_features = set(feature_columns) - set(features.columns)
+    if missing_features:
+        raise ValueError(
+            f"Current feature extractor is missing model columns: {sorted(missing_features)}"
+        )
+    classifier = artifact["classifier"]
+    positive_index = list(classifier.classes_).index(1)
+    probabilities = classifier.predict_proba(features[feature_columns])[:, positive_index]
+    return frame, probabilities, Counter(frequencies), len(pool)
+
+
+def _write_annotation_sheet(frame: pd.DataFrame, output_path: str | Path) -> None:
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    frame.loc[:, list(ANNOTATION_COLUMNS)].to_csv(
+        output, index=False, encoding="utf-8-sig"
+    )
+
+
+def create_independent_test_sample(
+    corpus_path: str | Path,
+    model_path: str | Path,
+    annotation_paths: Sequence[str | Path],
+    output_path: str | Path = "Test_Dataset.csv",
+    sample_size: int = 1000,
+    candidate_limit: int = 100000,
+    random_state: int = 42,
+    overwrite: bool = False,
+) -> dict[str, object]:
+    """Create a proportionate, prediction-hidden sample excluded from training groups."""
+    if sample_size < 2:
+        raise ValueError("sample_size must be at least 2 to include both prediction classes")
+    if candidate_limit < 1:
+        raise ValueError("candidate_limit must be positive")
+    output = Path(output_path)
+    metadata_path = _test_metadata_path(output)
+    if (output.exists() or metadata_path.exists()) and not overwrite:
+        raise FileExistsError(
+            f"{output} or its metadata already exists; choose a new path or pass --overwrite"
+        )
+
+    artifact = _load_variant_artifact(model_path)
+    excluded_pairs, excluded_groups, source_paths = _load_exclusions(
+        artifact, annotation_paths
+    )
+    frame, probabilities, frequencies, pool_count = _candidate_frame_for_model(
+        corpus_path,
+        artifact,
+        candidate_limit,
+        random_state,
+        excluded_pairs,
+        excluded_groups,
+    )
+    threshold = float(artifact["threshold"])
+    predictions = (probabilities >= threshold).astype(int)
+    positive_indices = np.flatnonzero(predictions == 1).tolist()
+    negative_indices = np.flatnonzero(predictions == 0).tolist()
+    if not positive_indices or not negative_indices:
+        raise ValueError(
+            "The eligible candidate pool must contain both predicted classes for a test sample"
+        )
+    if sample_size > len(frame):
+        raise ValueError(
+            f"Requested {sample_size} pairs, but only {len(frame)} unseen eligible pairs exist"
+        )
+
+    positive_quota = round(
+        sample_size * len(positive_indices) / len(frame)
+    )
+    positive_quota = max(1, min(sample_size - 1, positive_quota))
+    positive_quota = min(positive_quota, len(positive_indices))
+    negative_quota = sample_size - positive_quota
+    if negative_quota > len(negative_indices):
+        negative_quota = len(negative_indices)
+        positive_quota = sample_size - negative_quota
+    if positive_quota > len(positive_indices):
+        raise ValueError("Not enough unseen candidates from both predicted classes")
+
+    rng = random.Random(random_state)
+    selected = rng.sample(positive_indices, positive_quota)
+    selected.extend(rng.sample(negative_indices, negative_quota))
+    rng.shuffle(selected)
+    test_frame = frame.iloc[selected].loc[:, list(ANNOTATION_COLUMNS)].copy()
+    test_frame["is_variant"] = ""
+    pairs = {
+        canonical_pair(str(row.word1), str(row.word2))
+        for row in test_frame.itertuples(index=False)
+    }
+    overlap = pairs & excluded_pairs
+    if overlap:
+        raise RuntimeError(f"Internal error: {len(overlap)} training pairs entered the test set")
+    _write_annotation_sheet(test_frame, output)
+
+    source_digest = hashlib.sha256(
+        "\n".join(sorted(str(path) for path in source_paths)).encode("utf-8")
+    ).hexdigest()
+    metadata = {
+        "independent_test_dataset": True,
+        "created_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "test_dataset_path": str(output.resolve()),
+        "corpus": _file_metadata(corpus_path),
+        "model_sha256": _sha256_file(model_path),
+        "model_sklearn_version": artifact.get("sklearn_version"),
+        "training_data_fingerprint": artifact.get("training_data_fingerprint"),
+        "training_sources_fingerprint": source_digest,
+        "threshold": threshold,
+        "sample_size": len(test_frame),
+        "random_state": random_state,
+        "candidate_limit": candidate_limit,
+        "candidate_pool_pairs": pool_count,
+        "eligible_unseen_candidates": len(frame),
+        "excluded_annotated_pairs": len(excluded_pairs),
+        "excluded_lexical_groups": len(excluded_groups),
+        "eligible_predicted_positive": len(positive_indices),
+        "eligible_predicted_negative": len(negative_indices),
+        "sampled_predicted_positive": positive_quota,
+        "sampled_predicted_negative": negative_quota,
+        "test_pairs": [list(pair) for pair in sorted(pairs)],
+        "training_pair_overlap": len(overlap),
+        "prediction_values_are_hidden": True,
+        "corpus_vocabulary_size": len(frequencies),
+    }
+    metadata_path.write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    print(
+        f"[independent test sample] exported={len(test_frame)} "
+        f"positive={positive_quota} negative={negative_quota} "
+        f"pool={pool_count} eligible={len(frame)} output={output}"
+    )
+    return metadata
+
+
+def _parse_binary_value(value: object, field_name: str) -> int | None:
+    if value is None or pd.isna(value) or str(value).strip() == "":
+        return None
+    if isinstance(value, bool):
+        return int(value)
+    text = str(value).strip().casefold()
+    positive = {"1", "1.0", "true", "yes", "correct", "variant"}
+    negative = {"0", "0.0", "false", "no", "incorrect", "not variant"}
+    if text in positive:
+        return 1
+    if text in negative:
+        return 0
+    raise ValueError(
+        f"Invalid {field_name} value {value!r}; use correct/incorrect or 1/0"
+    )
+
+
+def _training_cv_summary(artifact: Mapping[str, object]) -> dict[str, object]:
+    evaluation = artifact.get("evaluation", {})
+    evaluation = evaluation if isinstance(evaluation, dict) else {}
+    matrix = evaluation.get("confusion_matrix")
+    if matrix and len(matrix) == 2 and len(matrix[0]) == 2:
+        tn, fp = int(matrix[0][0]), int(matrix[0][1])
+        fn, tp = int(matrix[1][0]), int(matrix[1][1])
+        total = tn + fp + fn + tp
+        accuracy = float(evaluation.get("accuracy", (tn + tp) / total if total else 0))
+        balanced = float(evaluation.get(
+            "balanced_accuracy",
+            ((tn / (tn + fp)) + (tp / (tp + fn))) / 2
+            if (tn + fp) and (tp + fn) else 0,
+        ))
+    else:
+        tn = fp = fn = tp = 0
+        total = int(artifact.get("verified_rows", 0))
+        accuracy = evaluation.get("accuracy")
+        balanced = evaluation.get("balanced_accuracy")
+    return {
+        "status": "AVAILABLE" if evaluation else "NOT_AVAILABLE",
+        "method": evaluation.get("method"),
+        "training_samples": int(artifact.get("verified_rows", total)),
+        "threshold": artifact.get("threshold"),
+        "accuracy": accuracy,
+        "precision": evaluation.get("precision"),
+        "recall": evaluation.get("recall"),
+        "f1": evaluation.get("f1"),
+        "balanced_accuracy": balanced,
+        "confusion_matrix": [[tn, fp], [fn, tp]],
+        "sklearn_version": artifact.get("sklearn_version"),
+    }
+
+
+def _load_final_report(path: str | Path, artifact: Mapping[str, object]) -> dict[str, object]:
+    report_path = Path(path)
+    if report_path.exists():
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    else:
+        report = {}
+    report["training_cross_validation"] = _training_cv_summary(artifact)
+    report.setdefault("final_output_precision", {"status": "NOT_EVALUATED"})
+    report.setdefault("independent_raw_test", {"status": "NOT_EVALUATED"})
+    return report
+
+
+def _format_percent(value: object) -> str:
+    return "N/A" if value is None else f"{100 * float(value):.2f}%"
+
+
+def _write_final_reports(
+    report: Mapping[str, object],
+    json_path: str | Path = "Final_Evaluation.json",
+    text_path: str | Path = "Final_Evaluation.txt",
+) -> None:
+    json_target, text_target = Path(json_path), Path(text_path)
+    json_target.parent.mkdir(parents=True, exist_ok=True)
+    text_target.parent.mkdir(parents=True, exist_ok=True)
+    json_target.write_text(
+        json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False),
+        encoding="utf-8",
+    )
+    cv = report["training_cross_validation"]
+    output = report["final_output_precision"]
+    test = report["independent_raw_test"]
+    lines = [
+        "FINAL EVALUATION REPORT",
+        "",
+        "1. TRAINING CROSS-VALIDATION",
+        f"Status: {cv.get('status')}",
+        f"Method: {cv.get('method') or 'N/A'}",
+        f"Training samples: {cv.get('training_samples', 0)}",
+        f"Threshold: {cv.get('threshold')}",
+        f"Accuracy: {_format_percent(cv.get('accuracy'))}",
+        f"Precision: {_format_percent(cv.get('precision'))}",
+        f"Recall: {_format_percent(cv.get('recall'))}",
+        f"F1-score: {_format_percent(cv.get('f1'))}",
+        f"Balanced accuracy: {_format_percent(cv.get('balanced_accuracy'))}",
+        "",
+        "2. FINAL RAW.TXT OUTPUT PRECISION",
+        f"Status: {output.get('status')}",
+        f"Evaluated pairs: {output.get('evaluated_pairs', 0)}",
+        f"Correct variants: {output.get('correct_variants', 0)}",
+        f"Incorrect variants: {output.get('incorrect_variants', 0)}",
+        f"Unreviewed pairs: {output.get('unreviewed_pairs', 0)}",
+        f"Output precision: {_format_percent(output.get('output_precision'))}",
+        "Required threshold: >70%",
+        "",
+        "3. INDEPENDENT RAW.TXT CANDIDATE TEST",
+        f"Status: {test.get('status')}",
+        f"Test samples: {test.get('test_samples', 0)}",
+        f"Evaluated samples: {test.get('evaluated_samples', 0)}",
+        f"Unreviewed samples: {test.get('unreviewed_samples', 0)}",
+        f"Training pair overlap: {test.get('training_pair_overlap', 'N/A')}",
+        f"Accuracy: {_format_percent(test.get('accuracy'))}",
+        f"Majority-class baseline accuracy: {_format_percent(test.get('majority_class_baseline_accuracy'))}",
+        f"Precision: {_format_percent(test.get('precision'))}",
+        f"Recall: {_format_percent(test.get('recall'))}",
+        f"F1-score: {_format_percent(test.get('f1'))}",
+        f"Balanced accuracy: {_format_percent(test.get('balanced_accuracy'))}",
+        f"Threshold: {test.get('threshold')}",
+        f"True positives: {test.get('true_positives', 0)}",
+        f"True negatives: {test.get('true_negatives', 0)}",
+        f"False positives: {test.get('false_positives', 0)}",
+        f"False negatives: {test.get('false_negatives', 0)}",
+        "Required accuracy: >70%",
+    ]
+    if test.get("confusion_matrix") is not None:
+        lines.extend(["Confusion matrix:", str(test["confusion_matrix"])])
+    text_target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def evaluate_final_output(
+    evaluation_xlsx: str | Path,
+    corpus_path: str | Path = "Raw.txt",
+    model_path: str | Path = "variant_classifier.pkl",
+    json_path: str | Path = "Final_Evaluation.json",
+    text_path: str | Path = "Final_Evaluation.txt",
+) -> dict[str, object]:
+    """Calculate final output precision from human-marked workbook cells."""
+    from openpyxl import load_workbook
+
+    workbook = load_workbook(evaluation_xlsx, read_only=True, data_only=True)
+    try:
+        sheet = workbook.active
+        try:
+            header_row = next(
+                sheet.iter_rows(min_row=1, max_row=1, values_only=True)
+            )
+        except StopIteration as error:
+            raise ValueError("Evaluation workbook is empty") from error
+        header = [
+            str(value).strip().casefold() if value is not None else ""
+            for value in header_row
+        ]
+        missing_columns = {"word1", "word2", "is_correct"} - set(header)
+        if missing_columns:
+            raise ValueError(
+                f"Evaluation workbook is missing columns: {sorted(missing_columns)}"
+            )
+        label_column = header.index("is_correct")
+        word1_column = header.index("word1")
+        word2_column = header.index("word2")
+        values: list[int | None] = []
+        for row in sheet.iter_rows(min_row=2, values_only=True):
+            if not row[word1_column] and not row[word2_column]:
+                continue
+            values.append(_parse_binary_value(row[label_column], "is_correct"))
+    finally:
+        workbook.close()
+
+    correct = sum(value == 1 for value in values)
+    incorrect = sum(value == 0 for value in values)
+    evaluated = correct + incorrect
+    unreviewed = len(values) - evaluated
+    precision = correct / evaluated if evaluated else None
+    complete = len(values) == FINAL_EVALUATION_SIZE and unreviewed == 0
+    status = (
+        "INCOMPLETE" if not complete
+        else "PASS" if precision is not None and precision > REQUIRED_ACCURACY
+        else "FAIL"
+    )
+    metrics: dict[str, object] = {
+        "status": status,
+        "input_corpus": str(corpus_path),
+        "evaluation_workbook": str(evaluation_xlsx),
+        "sample_pairs": len(values),
+        "evaluated_pairs": evaluated,
+        "correct_variants": correct,
+        "incorrect_variants": incorrect,
+        "unreviewed_pairs": unreviewed,
+        "output_precision": precision,
+        "required_precision_strictly_greater_than": REQUIRED_ACCURACY,
+        "requires_exactly_100_reviewed_pairs_for_pass": True,
+    }
+    artifact = _load_variant_artifact(model_path)
+    report = _load_final_report(json_path, artifact)
+    report["final_output_precision"] = metrics
+    _write_final_reports(report, json_path, text_path)
+
+    print("========== FINAL CORPUS EVALUATION ==========")
+    print(f"Input corpus: {corpus_path}")
+    print(f"Evaluated pairs: {evaluated}")
+    print(f"Correct variants: {correct}")
+    print(f"Incorrect variants: {incorrect}")
+    print(f"Unreviewed pairs: {unreviewed}")
+    print(f"Output precision: {_format_percent(precision)}")
+    print("Required threshold: >70%")
+    print(f"Result: {status}")
+    print("=============================================")
+    return metrics
+
+
+def evaluate_independent_test(
+    corpus_path: str | Path,
+    model_path: str | Path,
+    test_data_path: str | Path,
+    annotation_paths: Sequence[str | Path] = (),
+    json_path: str | Path = "Final_Evaluation.json",
+    text_path: str | Path = "Final_Evaluation.txt",
+) -> dict[str, object]:
+    """Evaluate frozen model predictions against manually labeled independent pairs."""
+    metadata_path = _test_metadata_path(test_data_path)
+    if not metadata_path.is_file():
+        raise FileNotFoundError(
+            f"Missing independence metadata {metadata_path}; generate the test sample "
+            "with the test-sample command."
+        )
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    if not metadata.get("independent_test_dataset"):
+        raise ValueError("Test dataset metadata does not identify an independent test set")
+    if metadata.get("model_sha256") != _sha256_file(model_path):
+        raise RuntimeError(
+            "The model changed after test-sample generation; create a fresh independent test set."
+        )
+    if tuple(metadata.get("corpus", ())) != _file_metadata(corpus_path):
+        raise RuntimeError(
+            "The corpus changed after test-sample generation; create a fresh independent test set."
+        )
+    artifact = _load_variant_artifact(model_path)
+    if metadata.get("threshold") != artifact.get("threshold"):
+        raise RuntimeError("The classifier threshold changed; generate a fresh independent test set.")
+
+    excluded_pairs, excluded_groups, _ = _load_exclusions(
+        artifact, annotation_paths, test_data_path
+    )
+    raw_frame = pd.read_csv(test_data_path, keep_default_na=False)
+    frame = validate_annotations(raw_frame)
+    test_pairs = {
+        canonical_pair(str(row.word1), str(row.word2))
+        for row in frame.itertuples(index=False)
+    }
+    registered_pairs = {
+        canonical_pair(str(pair[0]), str(pair[1]))
+        for pair in metadata.get("test_pairs", [])
+        if isinstance(pair, (list, tuple)) and len(pair) == 2
+    }
+    if registered_pairs != test_pairs:
+        raise RuntimeError(
+            "The pair identities in the labeled test CSV differ from its generation manifest."
+        )
+    exact_overlap = test_pairs & excluded_pairs
+    lexical_overlap_words = {
+        _canonical_word(word)
+        for pair in test_pairs
+        for word in pair
+    } & excluded_groups
+    if exact_overlap or lexical_overlap_words:
+        raise ValueError(
+            f"Independent test leakage detected: {len(exact_overlap)} exact pairs, "
+            f"{len(lexical_overlap_words)} lexical groups overlap training/annotations"
+        )
+
+    reviewed = frame[frame["is_variant"].isin(["0", "1"])].copy()
+    unreviewed = len(frame) - len(reviewed)
+    labels = reviewed["is_variant"].astype(int).to_numpy()
+    sample_is_complete = (
+        len(frame) == int(metadata.get("sample_size", -1))
+        and unreviewed == 0
+        and len(frame) > 0
+    )
+    threshold = float(artifact["threshold"])
+    if len(reviewed):
+        features = annotation_features(reviewed)
+        feature_columns = list(artifact.get("feature_columns", features.columns))
+        probabilities = artifact["classifier"].predict_proba(
+            features[feature_columns]
+        )[:, list(artifact["classifier"].classes_).index(1)]
+        predicted = (probabilities >= threshold).astype(int)
+        accuracy = float(accuracy_score(labels, predicted))
+        precision = float(precision_score(labels, predicted, zero_division=0))
+        recall = float(recall_score(labels, predicted, zero_division=0))
+        f1 = float(f1_score(labels, predicted, zero_division=0))
+        balanced_accuracy = float(balanced_accuracy_score(labels, predicted))
+        matrix = confusion_matrix(labels, predicted, labels=[0, 1]).tolist()
+        tn, fp = matrix[0]
+        fn, tp = matrix[1]
+        majority_baseline = float(max(np.bincount(labels)) / len(labels))
+    else:
+        accuracy = precision = recall = f1 = balanced_accuracy = None
+        matrix = [[0, 0], [0, 0]]
+        tn = fp = fn = tp = 0
+        majority_baseline = None
+    status = (
+        "INCOMPLETE" if not sample_is_complete
+        else "PASS" if accuracy is not None and accuracy > REQUIRED_ACCURACY
+        else "FAIL"
+    )
+    metrics: dict[str, object] = {
+        "status": status,
+        "input_corpus": str(corpus_path),
+        "test_dataset": str(test_data_path),
+        "test_samples": len(frame),
+        "evaluated_samples": len(reviewed),
+        "unreviewed_samples": unreviewed,
+        "training_pair_overlap": len(exact_overlap),
+        "training_lexical_group_overlap": len(lexical_overlap_words),
+        "threshold": threshold,
+        "accuracy": accuracy,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "balanced_accuracy": balanced_accuracy,
+        "majority_class_baseline_accuracy": majority_baseline,
+        "confusion_matrix": matrix,
+        "true_positives": int(tp),
+        "true_negatives": int(tn),
+        "false_positives": int(fp),
+        "false_negatives": int(fn),
+        "required_accuracy_strictly_greater_than": REQUIRED_ACCURACY,
+        "metrics_use_reviewed_rows_only": True,
+        "test_scope": "blocked candidate pairs sampled from Raw.txt, not all vocabulary pairs",
+    }
+    report = _load_final_report(json_path, artifact)
+    report["independent_raw_test"] = metrics
+    _write_final_reports(report, json_path, text_path)
+
+    print("========== INDEPENDENT RAW.TXT TEST ==========")
+    print(f"Input corpus: {corpus_path}")
+    print(f"Test samples: {len(frame)}")
+    print(f"Evaluated samples: {len(reviewed)}")
+    print(f"Unreviewed samples: {unreviewed}")
+    print(f"Training pair overlap: {len(exact_overlap)}")
+    print(f"Training lexical-group overlap: {len(lexical_overlap_words)}")
+    print(f"Classification threshold: {threshold:.4f}")
+    print(f"Accuracy: {_format_percent(accuracy)}")
+    print(f"Precision: {_format_percent(precision)}")
+    print(f"Recall: {_format_percent(recall)}")
+    print(f"F1-score: {_format_percent(f1)}")
+    print(f"Balanced accuracy: {_format_percent(balanced_accuracy)}")
+    print(f"True positives: {tp}")
+    print(f"True negatives: {tn}")
+    print(f"False positives: {fp}")
+    print(f"False negatives: {fn}")
+    print("Confusion matrix:")
+    print(f"[[{tn}, {fp}],")
+    print(f" [{fn}, {tp}]]")
+    print(f"Majority-class baseline accuracy: {_format_percent(majority_baseline)}")
+    print("Required accuracy: >70%")
+    print(f"Result: {status}")
+    print("==============================================")
+    return metrics
 
 
 def create_active_learning_sample(
@@ -717,8 +1433,7 @@ def create_active_learning_sample(
     """Export near-threshold, stratified unreviewed examples for human review."""
     if sample_size < 1:
         raise ValueError("sample_size must be positive")
-    with Path(model_path).open("rb") as stream:
-        artifact = pickle.load(stream)
+    artifact = _load_variant_artifact(model_path)
     classifier = artifact["classifier"]
     threshold = float(artifact["threshold"])
     frequencies = corpus_counts(corpus_path)
@@ -783,8 +1498,7 @@ def run_full_pipeline(
     random_state: int = 42,
 ) -> dict[str, object]:
     """Predict from a bounded candidate pool, resolve, export, and optionally sample."""
-    with Path(model_path).open("rb") as stream:
-        artifact = pickle.load(stream)
+    artifact = _load_variant_artifact(model_path)
     frequencies = corpus_counts(corpus_path)
     pool = generate_candidate_pool(frequencies, candidate_limit, random_state)
     records = _build_records(pool, frequencies)
@@ -897,6 +1611,37 @@ def main(argv: Sequence[str] | None = None) -> int:
     run.add_argument("--candidate-limit", type=int, default=100000)
     run.add_argument("--random-state", type=int, default=42)
 
+    evaluate = commands.add_parser(
+        "evaluate", help="Evaluate manually reviewed final output pairs"
+    )
+    evaluate.add_argument("--evaluation-xlsx", default="Evaluation.xlsx")
+    evaluate.add_argument("--corpus", default="Raw.txt")
+    evaluate.add_argument("--model", default="variant_classifier.pkl")
+    evaluate.add_argument("--json-output", default="Final_Evaluation.json")
+    evaluate.add_argument("--text-output", default="Final_Evaluation.txt")
+
+    test_sample = commands.add_parser(
+        "test-sample", help="Create a hidden-prediction independent Raw.txt test sample"
+    )
+    test_sample.add_argument("--corpus", default="Raw.txt")
+    test_sample.add_argument("--model", default="variant_classifier.pkl")
+    test_sample.add_argument("--annotations", nargs="+", required=True)
+    test_sample.add_argument("--output", default="Test_Dataset.csv")
+    test_sample.add_argument("--sample-size", type=int, default=1000)
+    test_sample.add_argument("--candidate-limit", type=int, default=100000)
+    test_sample.add_argument("--random-state", type=int, default=42)
+    test_sample.add_argument("--overwrite", action="store_true")
+
+    test = commands.add_parser(
+        "test", help="Evaluate manually labeled independent test candidates"
+    )
+    test.add_argument("--corpus", default="Raw.txt")
+    test.add_argument("--model", default="variant_classifier.pkl")
+    test.add_argument("--test-data", required=True)
+    test.add_argument("--annotations", nargs="*", default=[])
+    test.add_argument("--json-output", default="Final_Evaluation.json")
+    test.add_argument("--text-output", default="Final_Evaluation.txt")
+
     args = parser.parse_args(argv)
     if args.command == "generate":
         generate_annotation_candidates(
@@ -918,10 +1663,26 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.corpus, args.model, args.output, args.sample_size,
             args.pool_limit, args.random_state,
         )
-    else:
+    elif args.command == "run":
         run_full_pipeline(
             args.corpus, args.model, args.output_csv, args.evaluation_xlsx,
             args.candidate_limit, args.random_state,
+        )
+    elif args.command == "evaluate":
+        evaluate_final_output(
+            args.evaluation_xlsx, args.corpus, args.model,
+            args.json_output, args.text_output,
+        )
+    elif args.command == "test-sample":
+        create_independent_test_sample(
+            args.corpus, args.model, args.annotations, args.output,
+            args.sample_size, args.candidate_limit, args.random_state,
+            args.overwrite,
+        )
+    elif args.command == "test":
+        evaluate_independent_test(
+            args.corpus, args.model, args.test_data, args.annotations,
+            args.json_output, args.text_output,
         )
     return 0
 

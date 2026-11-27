@@ -85,6 +85,51 @@ py annotation_workflow.py train --annotations annotations_merged.csv --model var
 The `active` workflow leaves all labels blank. Add only human-verified values,
 then merge and retrain. It does not create pseudo-labels.
 
+## Final-output and independent testing
+
+The final-output precision evaluation reads the existing 100-row `Evaluation.xlsx`.
+Manually enter `TRUE`/`FALSE` or `1`/`0` in `is_correct` for each pair, then run:
+
+```powershell
+py annotation_workflow.py evaluate --evaluation-xlsx Evaluation.xlsx --corpus Raw.txt --model variant_classifier.pkl
+```
+
+Blank labels are unreviewed, not incorrect. A final PASS requires all 100 rows
+to be reviewed and precision strictly greater than 70%.
+
+Create a separate independent candidate test set after freezing the trained
+model and threshold:
+
+```powershell
+py annotation_workflow.py test-sample --corpus Raw.txt --model variant_classifier.pkl --annotations annotations_final.csv --output Test_Dataset.csv --sample-size 1000
+```
+
+The generator uses the same blocking and feature pipeline as prediction,
+excludes annotated word pairs and lexical groups, draws a reproducible sample
+proportional to the model's predicted positive/negative populations, and does
+not include model predictions in the CSV. Manually enter `1`, `0`, or blank in
+`is_variant`. Keep the generated `Test_Dataset.csv.metadata.json` beside the
+CSV; it records the model, threshold, corpus, and pair identities needed to
+check independence. Do not copy test labels into any training or active-learning
+annotation file.
+
+Evaluate the labeled sample without using its labels for training or threshold
+tuning:
+
+```powershell
+py annotation_workflow.py test --corpus Raw.txt --model variant_classifier.pkl --test-data Test_Dataset.csv --annotations annotations_final.csv
+```
+
+The command reports standard classification metrics, a confusion matrix,
+majority-class baseline, and unreviewed count. Accuracy exactly 70% is FAIL;
+only accuracy above 70% passes, and any unreviewed test rows produce
+INCOMPLETE. The independent result measures the blocked candidate pairs sampled
+from `Raw.txt`, not every possible word pair in its vocabulary. If the model,
+threshold, corpus, or feature pipeline changes after sample generation, create
+a fresh independent dataset before making a final assessment. `Final_Evaluation.json`
+and `Final_Evaluation.txt` keep training cross-validation, final-output
+precision, and independent-test performance in separate sections.
+
 ## Full-corpus prediction
 
 After you have enough reviewed positive and negative examples:
@@ -123,14 +168,21 @@ word1,word2,word1_count,word2_count,character_difference
 `is_correct` column is blank until a human manually verifies each pair.
 No automatic precision is claimed without human labels.
 
-## PDF conflict
+The installed scikit-learn version must match the pinned version in
+`requirements.txt`. Existing `variant_classifier.pkl` artifacts created with a
+different version should be regenerated after installing dependencies:
 
-The quiz PDF permits AI tools only until November 19, 8:00 am. The owner's
-current instructions require implementation in this session. This project
-therefore follows the PDF's technical output specifications but does not
-represent an attestation that its current AI-assisted development is compliant
-with the PDF's historical AI-use deadline. The codebase, report, and evidence
-must be handled according to the final instructor declaration.
+```powershell
+py -m pip install -r requirements.txt
+py annotation_workflow.py train --annotations annotations_final.csv --model variant_classifier.pkl
+```
+
+The spelling-variant classifier stores scikit-learn decision-tree estimators;
+retraining serializes them with the pinned version. PinoyBot's separate
+`classifier.pkl` and `vectorizer.pkl` are not spelling-variant model artifacts.
+The checked-in PinoyBot `classifier.pkl` and `vectorizer.pkl` were serialized
+with scikit-learn 1.9.1; the current dependency pin matches them. The existing
+spelling model should be retrained under that same environment before use.
 
 ## Algorithmic complexity
 

@@ -1,0 +1,42 @@
+FINAL EVALUATION REPORT
+
+1. TRAINING CROSS-VALIDATION
+Status: AVAILABLE
+Method: 5-fold out-of-fold
+Training samples: 793
+Threshold: 0.8999999999999998
+Accuracy: 91.42%
+Precision: 98.94%
+Recall: 58.13%
+F1-score: 73.23%
+Balanced accuracy: 78.98%
+
+2. FINAL RAW.TXT OUTPUT PRECISION
+Status: PASS
+Evaluated pairs: 100
+Correct variants: 77
+Incorrect variants: 23
+Unreviewed pairs: 0
+Output precision: 77.00%
+Required threshold: >70%
+
+3. INDEPENDENT RAW.TXT CANDIDATE TEST
+Status: INCOMPLETE
+Test samples: 1000
+Evaluated samples: 0
+Unreviewed samples: 1000
+Training pair overlap: 0
+Accuracy: N/A
+Majority-class baseline accuracy: N/A
+Precision: N/A
+Recall: N/A
+F1-score: N/A
+Balanced accuracy: N/A
+Threshold: 0.8999999999999998
+True positives: 0
+True negatives: 0
+False positives: 0
+False negatives: 0
+Required accuracy: >70%
+Confusion matrix:
+[[0, 0], [0, 0]]

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import importlib.util
+import json
 import sys
 import tempfile
 import types
@@ -9,7 +10,9 @@ import unittest
 from unittest import mock
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
+import sklearn
 
 
 ROOT = Path(__file__).parents[1]
@@ -37,6 +40,18 @@ def annotation_row(word1: str, word2: str, label: str = "") -> dict[str, object]
         "word2_context_examples": f"{word2} was in this context.",
         "is_variant": label,
     }
+
+
+class FixedProbabilityClassifier:
+    classes_ = np.array([0, 1])
+
+    def __init__(self, predicted: list[int]) -> None:
+        self.predicted = predicted
+
+    def predict_proba(self, features: pd.DataFrame) -> np.ndarray:
+        selected = self.predicted[:len(features)]
+        positive = np.array([0.9 if value else 0.1 for value in selected])
+        return np.column_stack((1 - positive, positive))
 
 
 class AnnotationWorkflowTests(unittest.TestCase):
@@ -117,6 +132,11 @@ class AnnotationWorkflowTests(unittest.TestCase):
             self.assertEqual(result["verified_rows"], 6)
             self.assertTrue(model_path.is_file())
             self.assertIn("oof_precision", result)
+            with model_path.open("rb") as stream:
+                artifact = workflow.pickle.load(stream)
+            self.assertEqual(artifact["sklearn_version"], sklearn.__version__)
+            self.assertEqual(len(artifact["training_pairs"]), 6)
+            self.assertTrue(artifact["training_data_fingerprint"])
 
     def test_candidate_csv_and_active_sample_use_real_contexts(self):
         original_loader = workflow._load_module
@@ -186,6 +206,278 @@ class AnnotationWorkflowTests(unittest.TestCase):
             self.assertGreater(active_count, 0)
             active = pd.read_csv(active_path, keep_default_na=False)
             self.assertTrue((active["is_variant"] == "").all())
+
+    def test_final_precision_requires_all_100_and_strictly_exceeds_70_percent(self):
+        artifact = {
+            "threshold": 0.9,
+            "verified_rows": 10,
+            "evaluation": {
+                "method": "test OOF",
+                "accuracy": 0.9,
+                "precision": 0.9,
+                "recall": 0.8,
+                "f1": 0.84,
+                "confusion_matrix": [[5, 0], [1, 4]],
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workbook_path = root / "Evaluation.xlsx"
+            rows = [
+                {**annotation_row(f"w{index}", f"x{index}"),
+                 "is_correct": index < 70}
+                for index in range(100)
+            ]
+            pd.DataFrame(rows).to_excel(workbook_path, index=False)
+            with mock.patch.object(
+                workflow, "_load_variant_artifact", return_value=artifact
+            ):
+                exactly_70 = workflow.evaluate_final_output(
+                    workbook_path,
+                    model_path=root / "model.pkl",
+                    json_path=root / "report.json",
+                    text_path=root / "report.txt",
+                )
+                self.assertEqual(exactly_70["output_precision"], 0.7)
+                self.assertEqual(exactly_70["status"], "FAIL")
+
+                rows[70]["is_correct"] = True
+                pd.DataFrame(rows).to_excel(workbook_path, index=False)
+                above_70 = workflow.evaluate_final_output(
+                    workbook_path,
+                    model_path=root / "model.pkl",
+                    json_path=root / "report.json",
+                    text_path=root / "report.txt",
+                )
+                self.assertEqual(above_70["output_precision"], 0.71)
+                self.assertEqual(above_70["status"], "PASS")
+
+    def test_final_precision_counts_blanks_as_unreviewed_and_rejects_bad_labels(self):
+        artifact = {"threshold": 0.5}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workbook_path = root / "Evaluation.xlsx"
+            rows = [
+                {**annotation_row(f"a{index}", f"b{index}"),
+                 "is_correct": True if index < 99 else ""}
+                for index in range(100)
+            ]
+            pd.DataFrame(rows).to_excel(workbook_path, index=False)
+            with mock.patch.object(
+                workflow, "_load_variant_artifact", return_value=artifact
+            ):
+                result = workflow.evaluate_final_output(
+                    workbook_path,
+                    model_path=root / "model.pkl",
+                    json_path=root / "report.json",
+                    text_path=root / "report.txt",
+                )
+            self.assertEqual(result["correct_variants"], 99)
+            self.assertEqual(result["unreviewed_pairs"], 1)
+            self.assertEqual(result["status"], "INCOMPLETE")
+            with self.assertRaisesRegex(ValueError, "Invalid is_correct"):
+                workflow._parse_binary_value("maybe", "is_correct")
+
+    def test_independent_test_sample_is_reproducible_hidden_and_proportionate(self):
+        artifact = {
+            "threshold": 0.5,
+            "training_pairs": [("known", "knownword")],
+        }
+        rows = [
+            annotation_row(f"left{index}", f"right{index}")
+            for index in range(12)
+        ]
+        frame = pd.DataFrame(rows, columns=workflow.ANNOTATION_COLUMNS)
+        probabilities = np.array([0.9] * 6 + [0.1] * 6)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            corpus = root / "tiny.txt"
+            corpus.write_text("A small corpus.", encoding="utf-8")
+            model_path = root / "model.pkl"
+            model_path.write_bytes(b"fixed model bytes")
+            with (
+                mock.patch.object(
+                    workflow, "_load_variant_artifact", return_value=artifact
+                ),
+                mock.patch.object(
+                    workflow,
+                    "_candidate_frame_for_model",
+                    return_value=(frame, probabilities, workflow.Counter(), 12),
+                ) as candidate_builder,
+            ):
+                first_path = root / "test-one.csv"
+                second_path = root / "test-two.csv"
+                first_meta = workflow.create_independent_test_sample(
+                    corpus, model_path, [], first_path, 4, 12, 17
+                )
+                workflow.create_independent_test_sample(
+                    corpus, model_path, [], second_path, 4, 12, 17
+                )
+            sample_call = candidate_builder.call_args
+            self.assertIn(("known", "knownword"), sample_call.args[4])
+            self.assertIn(workflow._canonical_word("known"), sample_call.args[5])
+            self.assertIn(workflow._canonical_word("knownword"), sample_call.args[5])
+            first = pd.read_csv(first_path, keep_default_na=False)
+            second = pd.read_csv(second_path, keep_default_na=False)
+            pd.testing.assert_frame_equal(first, second)
+            self.assertEqual(list(first.columns), list(workflow.ANNOTATION_COLUMNS))
+            self.assertTrue((first["is_variant"] == "").all())
+            self.assertEqual(first_meta["sampled_predicted_positive"], 2)
+            self.assertEqual(first_meta["sampled_predicted_negative"], 2)
+            self.assertEqual(first_meta["training_pair_overlap"], 0)
+            self.assertFalse(any("predict" in column for column in first.columns))
+
+    def _write_independent_test_fixture(
+        self,
+        root: Path,
+        labels: list[str],
+        predicted: list[int],
+    ) -> tuple[Path, Path, Path, dict[str, object]]:
+        corpus = root / "corpus.txt"
+        corpus.write_text("A minimal test corpus.", encoding="utf-8")
+        model = root / "model.pkl"
+        model.write_bytes(b"frozen model bytes")
+        test_data = root / "Test_Dataset.csv"
+        frame = pd.DataFrame(
+            [
+                annotation_row(f"testleft{index}", f"testright{index}", label)
+                for index, label in enumerate(labels)
+            ],
+            columns=workflow.ANNOTATION_COLUMNS,
+        )
+        frame.to_csv(test_data, index=False)
+        artifact: dict[str, object] = {
+            "classifier": FixedProbabilityClassifier(predicted),
+            "feature_columns": [],
+            "threshold": 0.5,
+            "training_pairs": [("trainingword", "trainingform")],
+            "verified_rows": 4,
+            "evaluation": {
+                "method": "test OOF",
+                "accuracy": 0.75,
+                "precision": 0.75,
+                "recall": 0.75,
+                "f1": 0.75,
+                "confusion_matrix": [[2, 1], [0, 1]],
+            },
+        }
+        metadata = {
+            "independent_test_dataset": True,
+            "sample_size": len(frame),
+            "model_sha256": workflow._sha256_file(model),
+            "corpus": list(workflow._file_metadata(corpus)),
+            "threshold": 0.5,
+            "test_dataset_path": str(test_data.resolve()),
+            "test_pairs": [
+                list(workflow.canonical_pair(row.word1, row.word2))
+                for row in frame.itertuples(index=False)
+            ],
+        }
+        workflow._test_metadata_path(test_data).write_text(
+            json.dumps(metadata), encoding="utf-8"
+        )
+        return corpus, model, test_data, artifact
+
+    def test_independent_metrics_confusion_baseline_and_strict_accuracy(self):
+        predicted = [1] * 7 + [0] * 3
+        exact_70_labels = ["1", "1", "1", "1", "1", "0", "0", "1", "0", "0"]
+        above_70_labels = ["1", "1", "1", "1", "1", "1", "0", "0", "0", "0"]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for labels, expected_status, expected_accuracy, expected_matrix in (
+                (exact_70_labels, "FAIL", 0.7, [[2, 2], [1, 5]]),
+                (above_70_labels, "PASS", 0.9, [[3, 1], [0, 6]]),
+            ):
+                case = root / expected_status
+                case.mkdir()
+                corpus, model, test_data, artifact = self._write_independent_test_fixture(
+                    case, labels, predicted
+                )
+                with (
+                    mock.patch.object(
+                        workflow, "_load_variant_artifact", return_value=artifact
+                    ),
+                    mock.patch.object(
+                        workflow,
+                        "annotation_features",
+                        side_effect=lambda frame: pd.DataFrame(index=range(len(frame))),
+                    ),
+                ):
+                    metrics = workflow.evaluate_independent_test(
+                        corpus,
+                        model,
+                        test_data,
+                        json_path=case / "report.json",
+                        text_path=case / "report.txt",
+                    )
+                self.assertEqual(metrics["status"], expected_status)
+                self.assertEqual(metrics["accuracy"], expected_accuracy)
+                self.assertEqual(metrics["training_pair_overlap"], 0)
+                self.assertEqual(metrics["confusion_matrix"], expected_matrix)
+                self.assertEqual(metrics["majority_class_baseline_accuracy"], 0.6)
+
+    def test_independent_test_incomplete_and_training_overlap_guard(self):
+        labels = ["1", "0", "1", "0", "1", "0", "1", "0", "1", ""]
+        predicted = [1, 0, 1, 0, 1, 0, 1, 0, 1, 0]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            corpus, model, test_data, artifact = self._write_independent_test_fixture(
+                root, labels, predicted
+            )
+            with (
+                mock.patch.object(
+                    workflow, "_load_variant_artifact", return_value=artifact
+                ),
+                mock.patch.object(
+                    workflow,
+                    "annotation_features",
+                    side_effect=lambda frame: pd.DataFrame(index=range(len(frame))),
+                ),
+            ):
+                metrics = workflow.evaluate_independent_test(
+                    corpus,
+                    model,
+                    test_data,
+                    json_path=root / "report.json",
+                    text_path=root / "report.txt",
+                )
+            self.assertEqual(metrics["evaluated_samples"], 9)
+            self.assertEqual(metrics["unreviewed_samples"], 1)
+            self.assertEqual(metrics["status"], "INCOMPLETE")
+
+            training_csv = root / "training.csv"
+            pd.DataFrame(
+                [annotation_row("pairb", "paira", "1")],
+                columns=workflow.ANNOTATION_COLUMNS,
+            ).to_csv(training_csv, index=False)
+            with mock.patch.object(
+                workflow,
+                "_known_independent_test_pairs",
+                return_value={("paira", "pairb")},
+            ):
+                with self.assertRaisesRegex(ValueError, "independent test dataset"):
+                    workflow._reject_independent_test_training([training_csv])
+
+    def test_independent_test_rejects_a_changed_frozen_model(self):
+        labels = ["1", "0"]
+        predicted = [1, 0]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            corpus, model, test_data, artifact = self._write_independent_test_fixture(
+                root, labels, predicted
+            )
+            model.write_bytes(b"changed model bytes")
+            with mock.patch.object(
+                workflow, "_load_variant_artifact", return_value=artifact
+            ):
+                with self.assertRaisesRegex(RuntimeError, "model changed"):
+                    workflow.evaluate_independent_test(
+                        corpus,
+                        model,
+                        test_data,
+                        json_path=root / "report.json",
+                        text_path=root / "report.txt",
+                    )
 
 
 if __name__ == "__main__":
