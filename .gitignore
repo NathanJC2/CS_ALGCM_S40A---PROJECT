@@ -1,0 +1,7 @@
+__pycache__/
+.annotation_cache.pkl
+.context_profiles.pkl
+.language_predictions.pkl
+/Raw.txt
+/classifier.pkl
+/vectorizer.pkl

@@ -38,7 +38,7 @@ def _timed(stage: str, operation: Callable[[], object]):
 
 def run_pipeline(
     corpus_paths: Sequence[str | Path],
-    labels_csv: str | Path,
+    labels_csv: str | Path | None,
     output_csv: str | Path,
     encoding: str = "utf-8",
     max_length_diff: int = 1,
@@ -58,6 +58,10 @@ def run_pipeline(
     random_state: int = 42,
     prediction_threshold: float = 0.5,
     cohesion_threshold: float = 0.75,
+    variant_model_path: str | Path = "variant_classifier.pkl",
+    test_limit: int | None = None,
+    evaluation_xlsx: str | Path | None = None,
+    evaluation_sample_size: int = 100,
 ) -> dict[str, object]:
     """Run the full pipeline and return stage counts and validation summary."""
     if not 0.0 <= prediction_threshold <= 1.0:
@@ -73,6 +77,19 @@ def run_pipeline(
 
     frequencies, sentences = _timed(
         "01 preprocess", lambda: preprocess.read_corpus(corpus_paths, encoding)
+    )
+    if test_limit is not None:
+        if test_limit < 1:
+            raise ValueError("test_limit must be positive")
+        sentences = sentences[:test_limit]
+        allowed = {word for sentence in sentences for word in sentence}
+        frequencies = pd.Series(
+            [sum(sentence.count(word) for sentence in sentences) for word in allowed],
+            index=sorted(allowed),
+        ).to_dict()
+    language_predictions = _timed(
+        "PinoyBot language identification",
+        lambda: preprocess.tag_vocabulary(frequencies),
     )
     candidates = _timed(
         "02 candidate blocking",
@@ -95,16 +112,20 @@ def run_pipeline(
         ),
     )
 
-    labels_frame = pd.read_csv(labels_csv)
-    required = {"word1", "word2", "is_variant"}
-    if not required.issubset(labels_frame.columns):
-        raise ValueError(
-            f"Label CSV must contain columns {sorted(required)}."
-        )
-    labels = pd.to_numeric(labels_frame["is_variant"], errors="raise").astype(int)
-    if not set(labels.unique()).issubset({0, 1}):
-        raise ValueError("is_variant labels must be binary values 0 or 1.")
-    labeled_pairs = list(zip(labels_frame["word1"].astype(str), labels_frame["word2"].astype(str)))
+    labeled_pairs: list[tuple[str, str]] = []
+    labels: list[int] = []
+    if labels_csv is not None:
+        labels_frame = pd.read_csv(labels_csv)
+        required = {"word1", "word2", "is_variant"}
+        if not required.issubset(labels_frame.columns):
+            raise ValueError(f"Label CSV must contain columns {sorted(required)}.")
+        labels = pd.to_numeric(labels_frame["is_variant"], errors="raise").astype(int).tolist()
+        if not set(labels).issubset({0, 1}):
+            raise ValueError("is_variant labels must be binary values 0 or 1.")
+        labeled_pairs = list(zip(
+            labels_frame["word1"].astype(str),
+            labels_frame["word2"].astype(str),
+        ))
     all_pairs = labeled_pairs + candidates
     edit_analyses = _timed(
         "03 dynamic programming",
@@ -125,36 +146,70 @@ def run_pipeline(
             char_ngram_min=char_ngram_min,
             char_ngram_max=char_ngram_max,
             edit_analyses=edit_analyses,
+            language_predictions=language_predictions,
         ),
     )
     training_features = combined_features.iloc[:len(labeled_pairs)].reset_index(drop=True)
-    training = _timed(
-        "06 classifier training",
-        lambda: classifier.train_classifier(
-            training_features,
-            labels.tolist(),
-            n_estimators=n_estimators,
-            n_splits=n_splits,
-            random_state=random_state,
-        ),
-    )
+    model_path = Path(variant_model_path)
+    if labeled_pairs:
+        training = _timed(
+            "06 classifier training",
+            lambda: classifier.train_classifier(
+                training_features,
+                labels,
+                n_estimators=n_estimators,
+                n_splits=n_splits,
+                random_state=random_state,
+            ),
+        )
+        selected_threshold = _timed(
+            "06 threshold tuning",
+            lambda: classifier.tune_threshold(
+                training.classifier, training_features, labels,
+            ),
+        )
+        classifier.save_training_artifacts(
+            training, model_path, selected_threshold,
+        )
+    elif model_path.is_file():
+        artifact = _timed(
+            "06 load classifier",
+            lambda: classifier.load_training_artifacts(model_path),
+        )
+        training = None
+        selected_threshold = float(artifact["threshold"])
+        trained_classifier = artifact["classifier"]
+        trained_feature_columns = tuple(artifact["feature_columns"])
+    else:
+        raise FileNotFoundError(
+            "No verified word-pair labels or existing variant_classifier.pkl were provided. "
+            "Create labels with word1,word2,is_variant and run training explicitly."
+        )
 
     candidate_features = combined_features.iloc[len(labeled_pairs):].reset_index(drop=True)
     def predict_and_resolve():
         if candidate_features.empty:
             return []
-        class_index = list(training.classifier.classes_).index(1)
-        probabilities = training.classifier.predict_proba(
-            candidate_features[list(features.FEATURE_COLUMNS)]
+        active_classifier = (
+            training.classifier if training is not None else trained_classifier
+        )
+        feature_columns = (
+            list(features.FEATURE_COLUMNS)
+            if training is not None
+            else list(trained_feature_columns)
+        )
+        class_index = list(active_classifier.classes_).index(1)
+        probabilities = active_classifier.predict_proba(
+            candidate_features[feature_columns]
         )[:, class_index]
         scored = [
             (row.word1, row.word2, float(probability))
             for row, probability in zip(candidate_features.itertuples(index=False), probabilities)
-            if probability >= prediction_threshold
+            if probability >= selected_threshold
         ]
         return resolver.resolve_variant_pairs(
             scored,
-            minimum_confidence=prediction_threshold,
+            minimum_confidence=selected_threshold,
             cohesion_threshold=cohesion_threshold,
         )
 
@@ -163,13 +218,29 @@ def run_pipeline(
         "08 CSV export",
         lambda: exporter.export_variants(resolved, dict(frequencies), output_csv),
     )
+    evaluated_pairs = 0
+    if evaluation_xlsx is not None:
+        sampler = _load_stage("09_sampler_for_evaluation.py", "pipeline_sampler")
+        evaluated_pairs = _timed(
+            "09 evaluation sample",
+            lambda: sampler.create_evaluation_sample(
+                output_csv,
+                evaluation_xlsx,
+                sample_size=evaluation_sample_size,
+                random_state=random_state,
+            ),
+        )
     summary = {
         "vocabulary_size": len(frequencies),
         "candidate_pairs": len(candidates),
         "labeled_pairs": len(labeled_pairs),
         "resolved_pairs": len(resolved),
         "exported_pairs": exported_count,
-        "cross_validation_accuracy_mean": float(training.cv_scores.mean()),
+        "cross_validation_accuracy_mean": (
+            float(training.cv_scores.mean()) if training is not None else None
+        ),
+        "prediction_threshold": float(selected_threshold),
+        "evaluation_sample_pairs": evaluated_pairs,
         "output_csv": str(output_csv),
         "embedding_backend": context_model.backend,
     }
@@ -246,12 +317,16 @@ def main() -> int:
     parser.add_argument("--random-state", type=int, default=42)
     parser.add_argument("--prediction-threshold", type=float, default=0.5)
     parser.add_argument("--cohesion-threshold", type=float, default=0.75)
+    parser.add_argument("--variant-model", default="variant_classifier.pkl")
+    parser.add_argument("--test-limit", type=int, help="Limit preprocessing to this many sentences")
+    parser.add_argument("--evaluation-xlsx", help="Optional Evaluation.xlsx output")
+    parser.add_argument("--evaluation-sample-size", type=int, default=100)
     args = parser.parse_args()
     if args.demo:
         _run_synthetic_demo()
         return 0
-    if not args.corpus or not args.labels_csv or not args.output_csv:
-        parser.error("--corpus, --labels-csv, and --output-csv are required unless --demo is used.")
+    if not args.corpus or not args.output_csv:
+        parser.error("--corpus and --output-csv are required unless --demo is used.")
     run_pipeline(
         args.corpus,
         args.labels_csv,
@@ -274,6 +349,10 @@ def main() -> int:
         random_state=args.random_state,
         prediction_threshold=args.prediction_threshold,
         cohesion_threshold=args.cohesion_threshold,
+        variant_model_path=args.variant_model,
+        test_limit=args.test_limit,
+        evaluation_xlsx=args.evaluation_xlsx,
+        evaluation_sample_size=args.evaluation_sample_size,
     )
     return 0
 

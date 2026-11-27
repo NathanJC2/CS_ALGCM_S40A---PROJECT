@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import json
+import pickle
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -35,6 +37,34 @@ class TrainingResult:
     rule_tree: DecisionTreeClassifier
     cv_scores: np.ndarray
     feature_columns: tuple[str, ...]
+    threshold: float = 0.5
+
+
+def tune_threshold(
+    classifier: RandomForestClassifier,
+    features: pd.DataFrame,
+    labels: Sequence[int],
+    candidate_thresholds: Iterable[float] | None = None,
+) -> float:
+    """Choose the threshold maximizing validation F1 while prioritizing precision."""
+    from sklearn.metrics import precision_recall_fscore_support
+
+    target = np.asarray(labels, dtype=int)
+    class_index = list(classifier.classes_).index(1)
+    probabilities = classifier.predict_proba(features[list(FEATURE_COLUMNS)])[:, class_index]
+    thresholds = list(candidate_thresholds or np.arange(0.10, 0.91, 0.05))
+    best_threshold = 0.5
+    best_key = (-1.0, -1.0)
+    for threshold in thresholds:
+        predicted = (probabilities >= threshold).astype(int)
+        precision, recall, f1, _ = precision_recall_fscore_support(
+            target, predicted, average="binary", zero_division=0
+        )
+        key = (precision, f1)
+        if key > best_key:
+            best_key = key
+            best_threshold = float(threshold)
+    return best_threshold
 
 
 def export_uncertain_pairs(
@@ -121,6 +151,31 @@ def extract_decision_rules(result: TrainingResult) -> str:
         feature_names=list(result.feature_columns),
         decimals=3,
     )
+
+
+def save_training_artifacts(
+    result: TrainingResult,
+    model_path: str | Path,
+    threshold: float,
+) -> None:
+    model_path = Path(model_path)
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    with model_path.open("wb") as stream:
+        pickle.dump(
+            {
+                "classifier": result.classifier,
+                "rule_tree": result.rule_tree,
+                "feature_columns": result.feature_columns,
+                "threshold": float(threshold),
+                "cv_scores": result.cv_scores.tolist(),
+            },
+            stream,
+        )
+
+
+def load_training_artifacts(model_path: str | Path) -> dict[str, object]:
+    with Path(model_path).open("rb") as stream:
+        return pickle.load(stream)
 
 
 def main() -> int:

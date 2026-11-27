@@ -10,29 +10,50 @@ Model training and feature extraction should be implemented in a separate script
 
 import os
 import pickle
-from typing import List
+from functools import lru_cache
+from typing import Iterable, Sequence
 
 from features import extract_features
 
 
-# -------------------------------------------------------
-# Load Saved Model
-# -------------------------------------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
 CLASSIFIER_PATH = os.path.join(BASE_DIR, "classifier.pkl")
 VECTORIZER_PATH = os.path.join(BASE_DIR, "vectorizer.pkl")
 
-with open(CLASSIFIER_PATH, "rb") as f:
-    classifier = pickle.load(f)
 
-with open(VECTORIZER_PATH, "rb") as f:
-    vectorizer = pickle.load(f)
+def load_artifacts(
+    classifier_path: str | os.PathLike[str] = CLASSIFIER_PATH,
+    vectorizer_path: str | os.PathLike[str] = VECTORIZER_PATH,
+):
+    if not os.path.isfile(classifier_path) or not os.path.isfile(vectorizer_path):
+        raise FileNotFoundError(
+            "PinoyBot artifacts are missing. Run: python train_model.py"
+        )
+    with open(classifier_path, "rb") as stream:
+        classifier = pickle.load(stream)
+    with open(vectorizer_path, "rb") as stream:
+        vectorizer = pickle.load(stream)
+    return classifier, vectorizer
 
-# -------------------------------------------------------
-# Main Prediction Function
-# -------------------------------------------------------
-def tag_language(tokens: List[str]) -> List[str]:
+
+@lru_cache(maxsize=1)
+def _get_artifacts():
+    return load_artifacts()
+
+
+def predict_language(tokens: Sequence[str]) -> tuple[list[str], list[list[float]], list[str]]:
+    """Return labels, class probabilities, and class names in batch."""
+    if not tokens:
+        return [], [], []
+    classifier, vectorizer = _get_artifacts()
+    matrix = vectorizer.transform([extract_features(str(token)) for token in tokens])
+    labels = classifier.predict(matrix)
+    probabilities = classifier.predict_proba(matrix)
+    classes = [str(label) for label in classifier.classes_]
+    return labels.tolist(), probabilities.tolist(), classes
+
+
+def tag_language(tokens: Iterable[str]) -> list[str]:
     """
     Predict the language tag of every token.
 
@@ -44,9 +65,5 @@ def tag_language(tokens: List[str]) -> List[str]:
     -------
     list[str]
     """
-    if not tokens:
-        return []
-    features = [extract_features(token) for token in tokens]
-    X = vectorizer.transform(features)
-    predictions = classifier.predict(X)
-    return predictions.tolist()
+    labels, _, _ = predict_language(list(tokens))
+    return labels

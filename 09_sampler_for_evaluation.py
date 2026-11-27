@@ -42,9 +42,15 @@ def create_evaluation_sample(
     sampled.to_excel(output_path, index=False)
     workbook = load_workbook(output_path)
     worksheet = workbook.active
-    worksheet["G1"] = "overall_precision"
+    worksheet["G1"] = "manual_evaluation_status"
+    worksheet["G2"] = "UNAVAILABLE - enter TRUE/FALSE in is_correct"
+    worksheet["H1"] = "overall_precision"
     last_row = max(2, len(sampled) + 1)
-    worksheet["G2"] = f'=IFERROR(COUNTIF(F2:F{last_row},TRUE)/COUNT(F2:F{last_row}),0)'
+    worksheet["H2"] = (
+        f'=IF(COUNTIF(F2:F{last_row},"TRUE")+COUNTIF(F2:F{last_row},"FALSE")=0,'
+        f'"UNAVAILABLE",COUNTIF(F2:F{last_row},"TRUE")/'
+        f'(COUNTIF(F2:F{last_row},"TRUE")+COUNTIF(F2:F{last_row},"FALSE")))'
+    )
     workbook.save(output_path)
     return len(sampled)
 

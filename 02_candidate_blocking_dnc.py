@@ -9,12 +9,21 @@ from typing import Iterable, Sequence
 
 
 def _signatures(word: str) -> frozenset[str]:
-    """Build lightweight unigram, bigram, and consonant-skeleton signatures."""
+    """Build canonical, deletion, and sparse n-gram signatures."""
     lowered = word.lower()
-    consonants = "".join(char for char in lowered if char not in "aeiou")
-    signatures = {f"u:{char}" for char in lowered}
-    signatures.update(f"b:{lowered[index:index + 2]}" for index in range(len(lowered) - 1))
-    signatures.add(f"s:{consonants}")
+    signatures: set[str] = set()
+    signatures.update(
+        f"g:{lowered[index:index + 3]}"
+        for index in range(0, len(lowered) - 2, 2)
+    )
+    # Canonicalize known Filipino spelling alternations for a lossless key index.
+    canonical = word.lower()
+    for old, new in (("ph", "f"), ("qu", "k"), ("f", "p"), ("c", "k"),
+                      ("o", "u"), ("e", "i"), ("d", "r")):
+        canonical = canonical.replace(old, new)
+    signatures.add(f"k:{canonical}")
+    for index in range(len(word)):
+        signatures.add(f"d:{word[:index]}{word[index + 1:]}")
     return frozenset(signatures)
 
 
@@ -79,29 +88,44 @@ def generate_candidates(
     if max_length_diff < 0 or leaf_size < 1 or max_pairs_per_signature < 1:
         raise ValueError("Blocking limits must be positive (length difference may be zero).")
 
-    buckets: dict[int, list[str]] = defaultdict(list)
-    for word in sorted(set(vocabulary)):
-        if word:
-            buckets[len(word)].append(word)
+    words = sorted(set(vocabulary))
+    if not words:
+        return []
 
     output: set[tuple[str, str]] = set()
-    indexes: dict[int, dict[str, list[str]]] = {}
-    for length, words in sorted(buckets.items()):
-        indexes[length] = _divide_bucket(
-            words, output, leaf_size, max_pairs_per_signature
-        )
+    signature_index: dict[str, list[str]] = defaultdict(list)
+    for word in words:
+        for signature in _signatures(word):
+            signature_index[signature].append(word)
 
-    lengths = sorted(indexes)
+    for posting in signature_index.values():
+        if len(posting) < 2:
+            continue
+        posting = sorted(set(posting))
+        for position, word1 in enumerate(posting):
+            for word2 in posting[position + 1:position + 1 + max_pairs_per_signature]:
+                if abs(len(word1) - len(word2)) <= max_length_diff:
+                    output.add(tuple(sorted((word1, word2))))
+
+    # Length buckets are a final divide-and-conquer partition: recursive leaf
+    # indexes are merged, but only cross-posting pairs reach the output.
+    buckets: dict[int, list[str]] = defaultdict(list)
+    for word in words:
+        buckets[len(word)].append(word)
+    lengths = sorted(buckets)
     for position, length in enumerate(lengths):
         for other_length in lengths[position + 1:]:
             if other_length - length > max_length_diff:
                 break
-            _add_cross_pairs(
-                indexes[length],
-                indexes[other_length],
-                output,
-                max_pairs_per_signature,
+            left = _divide_bucket(
+                buckets[length], set(), leaf_size, max_pairs_per_signature
             )
+            right = _divide_bucket(
+                buckets[other_length], set(), leaf_size, max_pairs_per_signature
+            )
+            cross_output: set[tuple[str, str]] = set()
+            _add_cross_pairs(left, right, cross_output, max_pairs_per_signature)
+            output.update(cross_output)
     return sorted(output)
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import os
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -11,8 +12,6 @@ from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
 
 
 def _edit_analyzer():
@@ -42,6 +41,12 @@ FEATURE_COLUMNS = (
     "log_frequency_ratio",
     "minimum_frequency_met",
     "character_ngram_tfidf_cosine",
+    "word_length_difference",
+    "common_prefix_length",
+    "common_suffix_length",
+    "pinoy_language_same",
+    "pinoy_filipino_probability",
+    "pinoy_language_confidence",
 )
 
 
@@ -61,6 +66,20 @@ def _collect_contexts(
     return contexts
 
 
+def _character_ngram_cosine(word1: str, word2: str, minimum: int, maximum: int) -> float:
+    """Cohort-independent binary character n-gram cosine similarity."""
+    def grams(word: str) -> set[str]:
+        padded = f"^{word}$"
+        return {
+            padded[index:index + width]
+            for width in range(minimum, maximum + 1)
+            for index in range(max(0, len(padded) - width + 1))
+        }
+
+    left, right = grams(word1), grams(word2)
+    return len(left & right) / float(max(1, len(left) * len(right)) ** 0.5)
+
+
 def build_feature_matrix(
     candidate_pairs: Iterable[tuple[str, str]],
     frequencies: Mapping[str, int],
@@ -71,6 +90,7 @@ def build_feature_matrix(
     char_ngram_min: int = 2,
     char_ngram_max: int = 4,
     edit_analyses: Mapping[tuple[str, str], Any] | None = None,
+    language_predictions: Mapping[str, Mapping[str, object]] | None = None,
 ) -> pd.DataFrame:
     """Return pair identifiers and numeric features for every candidate.
 
@@ -87,21 +107,6 @@ def build_feature_matrix(
     if not pairs:
         return pd.DataFrame(columns=columns)
 
-    vocabulary = sorted(set(frequencies).union(*(set(pair) for pair in pairs)))
-    vectorizer = TfidfVectorizer(
-        analyzer="char",
-        ngram_range=(char_ngram_min, char_ngram_max),
-        lowercase=False,
-    )
-    try:
-        word_vectors = vectorizer.fit_transform(vocabulary)
-    except ValueError:
-        fallback_max = max(char_ngram_min, char_ngram_max)
-        vectorizer = TfidfVectorizer(
-            analyzer="char", ngram_range=(1, fallback_max), lowercase=False
-        )
-        word_vectors = vectorizer.fit_transform(vocabulary)
-    word_index = {word: index for index, word in enumerate(vocabulary)}
     local_contexts = _collect_contexts(sentences, context_window)
     rows: list[dict[str, float | str]] = []
     vowels = set("aeiou")
@@ -120,6 +125,24 @@ def build_feature_matrix(
             "edit_position_middle": float(any(1 / 3 < position < 2 / 3 for position in positions)),
             "edit_position_end": float(any(position >= 2 / 3 for position in positions)),
         }
+        common_prefix = len(os.path.commonprefix([word1, word2]))
+        common_suffix = 0
+        for left, right in zip(reversed(word1), reversed(word2)):
+            if left != right:
+                break
+            common_suffix += 1
+        language1 = language_predictions.get(word1, {}) if language_predictions else {}
+        language2 = language_predictions.get(word2, {}) if language_predictions else {}
+        probabilities1 = language1.get("probabilities", {})
+        probabilities2 = language2.get("probabilities", {})
+        filipino_probability = (
+            float(probabilities1.get("FIL", 0.0)) +
+            float(probabilities2.get("FIL", 0.0))
+        ) / 2.0
+        confidence = (
+            float(language1.get("confidence", 0.0)) +
+            float(language2.get("confidence", 0.0))
+        ) / 2.0
         rows.append(
             {
                 "word1": word1,
@@ -167,11 +190,17 @@ def build_feature_matrix(
                 "minimum_frequency_met": float(
                     min(frequencies.get(word1, 0), frequencies.get(word2, 0)) >= min_frequency
                 ),
-                "character_ngram_tfidf_cosine": float(
-                    cosine_similarity(
-                        word_vectors[word_index[word1]], word_vectors[word_index[word2]]
-                    )[0, 0]
+                "character_ngram_tfidf_cosine": _character_ngram_cosine(
+                    word1, word2, char_ngram_min, char_ngram_max
                 ),
+                "word_length_difference": float(abs(len(word1) - len(word2))),
+                "common_prefix_length": float(common_prefix),
+                "common_suffix_length": float(common_suffix),
+                "pinoy_language_same": float(
+                    bool(language1 and language2 and language1["label"] == language2["label"])
+                ),
+                "pinoy_filipino_probability": filipino_probability,
+                "pinoy_language_confidence": confidence,
             }
         )
     return pd.DataFrame(rows, columns=columns)
@@ -199,5 +228,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    assert len(FEATURE_COLUMNS) == 13
+    assert len(FEATURE_COLUMNS) == 19
     raise SystemExit(main())
