@@ -21,22 +21,22 @@ Output precision: 77.00%
 Required threshold: >70%
 
 3. INDEPENDENT RAW.TXT CANDIDATE TEST
-Status: INCOMPLETE
-Test samples: 1000
-Evaluated samples: 0
-Unreviewed samples: 1000
+Status: PASS
+Test samples: 5000
+Evaluated samples: 5000
+Unreviewed samples: 0
 Training pair overlap: 0
-Accuracy: N/A
-Majority-class baseline accuracy: N/A
-Precision: N/A
-Recall: N/A
-F1-score: N/A
-Balanced accuracy: N/A
+Accuracy: 89.92%
+Majority-class baseline accuracy: 85.42%
+Precision: 79.22%
+Recall: 41.84%
+F1-score: 54.76%
+Balanced accuracy: 69.98%
 Threshold: 0.8999999999999998
-True positives: 0
-True negatives: 0
-False positives: 0
-False negatives: 0
+True positives: 305
+True negatives: 4191
+False positives: 80
+False negatives: 424
 Required accuracy: >70%
 Confusion matrix:
-[[0, 0], [0, 0]]
+[[4191, 80], [424, 305]]

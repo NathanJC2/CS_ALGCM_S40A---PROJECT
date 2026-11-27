@@ -35,35 +35,35 @@
     "requires_exactly_100_reviewed_pairs_for_pass": true
   },
   "independent_raw_test": {
-    "status": "INCOMPLETE",
+    "status": "PASS",
     "input_corpus": "Raw.txt",
-    "test_dataset": "Test_Dataset.csv",
-    "test_samples": 1000,
-    "evaluated_samples": 0,
-    "unreviewed_samples": 1000,
+    "test_dataset": "Test_Dataset_5000.csv",
+    "test_samples": 5000,
+    "evaluated_samples": 5000,
+    "unreviewed_samples": 0,
     "training_pair_overlap": 0,
     "training_lexical_group_overlap": 0,
     "threshold": 0.8999999999999998,
-    "accuracy": null,
-    "precision": null,
-    "recall": null,
-    "f1": null,
-    "balanced_accuracy": null,
-    "majority_class_baseline_accuracy": null,
+    "accuracy": 0.8992,
+    "precision": 0.7922077922077922,
+    "recall": 0.41838134430727025,
+    "f1": 0.547576301615799,
+    "balanced_accuracy": 0.699825183977564,
+    "majority_class_baseline_accuracy": 0.8542,
     "confusion_matrix": [
       [
-        0,
-        0
+        4191,
+        80
       ],
       [
-        0,
-        0
+        424,
+        305
       ]
     ],
-    "true_positives": 0,
-    "true_negatives": 0,
-    "false_positives": 0,
-    "false_negatives": 0,
+    "true_positives": 305,
+    "true_negatives": 4191,
+    "false_positives": 80,
+    "false_negatives": 424,
     "required_accuracy_strictly_greater_than": 0.7,
     "metrics_use_reviewed_rows_only": true,
     "test_scope": "blocked candidate pairs sampled from Raw.txt, not all vocabulary pairs"

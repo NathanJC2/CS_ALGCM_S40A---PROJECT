@@ -47,6 +47,43 @@ class PipelineTests(unittest.TestCase):
         self.assertIn(("politiko", "pulitiko"), candidates)
         self.assertIn(("lalake", "lalaki"), candidates)
 
+    def test_batched_candidate_generation_matches_full_blocker(self):
+        module = load("02_candidate_blocking_dnc.py")
+        words = [
+            "politiko", "pulitiko", "opo", "upo", "lalaki", "lalake",
+            "bato", "boto", "pamilya", "pamiliya", "salamat",
+        ]
+        expected = module.generate_candidates(
+            words, max_length_diff=2, leaf_size=3, max_pairs_per_signature=20
+        )
+        batches = list(module.iter_candidate_batches(
+            words,
+            batch_size=3,
+            max_length_diff=2,
+            leaf_size=3,
+            max_pairs_per_signature=20,
+        ))
+        actual = [pair for batch in batches for pair in batch]
+        self.assertEqual(actual, expected)
+        self.assertTrue(all(len(batch) <= 3 for batch in batches))
+
+    def test_batched_blocker_has_no_global_one_hundred_thousand_pair_cap(self):
+        module = load("02_candidate_blocking_dnc.py")
+        words = [f"abc{index:03d}" for index in range(500)]
+        total = 0
+        largest_batch = 0
+        for batch in module.iter_candidate_batches(
+            words,
+            batch_size=4096,
+            max_length_diff=0,
+            leaf_size=32,
+            max_pairs_per_signature=5000,
+        ):
+            total += len(batch)
+            largest_batch = max(largest_batch, len(batch))
+        self.assertGreater(total, 100000)
+        self.assertLessEqual(largest_batch, 4096)
+
     def test_export_deduplicates_and_formats_csv(self):
         with tempfile.TemporaryDirectory() as directory:
             module = load("08_export_variants_csv.py")

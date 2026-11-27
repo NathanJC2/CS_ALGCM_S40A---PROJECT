@@ -479,6 +479,129 @@ class AnnotationWorkflowTests(unittest.TestCase):
                         text_path=root / "report.txt",
                     )
 
+    def test_full_corpus_test_batches_predictions_and_scores_external_truth(self):
+        candidate_pairs = [
+            ("politiko", "pulitiko"),
+            ("bato", "boto"),
+            ("trained", "training"),
+            ("trained", "trainish"),
+        ]
+        artifact = {
+            "classifier": FixedProbabilityClassifier([1, 0, 1, 0]),
+            "feature_columns": ["test_feature"],
+            "threshold": 0.5,
+            "training_pairs": [("trained", "training")],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            corpus = root / "Raw.txt"
+            corpus.write_text("A small spelling test corpus.", encoding="utf-8")
+            model = root / "variant_classifier.pkl"
+            model.write_bytes(b"frozen model bytes")
+            training_csv = root / "training.csv"
+            pd.DataFrame(
+                [annotation_row("trained", "training", "1")],
+                columns=workflow.ANNOTATION_COLUMNS,
+            ).to_csv(training_csv, index=False)
+            ground_truth = root / "ground_truth.csv"
+            pd.DataFrame([
+                ("politiko", "pulitiko", "1"),
+                ("bato", "boto", "0"),
+                ("missed", "missform", "1"),
+                ("trained", "training", "0"),
+                ("trained", "trainish", "1"),
+            ], columns=["word1", "word2", "is_variant"]).to_csv(
+                ground_truth, index=False
+            )
+            frequencies = workflow.Counter({
+                "politiko": 5, "pulitiko": 4,
+                "bato": 3, "boto": 2,
+                "trained": 2, "training": 1, "trainish": 1,
+                "missed": 1, "missform": 1,
+            })
+            original_loader = workflow._load_module
+
+            def fake_loader(filename: str, module_name: str):
+                if filename == "02_candidate_blocking_dnc.py":
+                    return types.SimpleNamespace(
+                        iter_candidate_batches=lambda *args, **kwargs: iter(
+                            [candidate_pairs[:2], candidate_pairs[2:]]
+                        )
+                    )
+                return original_loader(filename, module_name)
+
+            with (
+                mock.patch.object(
+                    workflow, "_load_variant_artifact", return_value=artifact
+                ),
+                mock.patch.object(
+                    workflow, "corpus_counts", return_value=frequencies
+                ),
+                mock.patch.object(
+                    workflow,
+                    "_predict_languages",
+                    return_value={word: "FIL" for word in frequencies},
+                ),
+                mock.patch.object(
+                    workflow,
+                    "_collect_pair_contexts",
+                    return_value=({}, {}),
+                ),
+                mock.patch.object(
+                    workflow,
+                    "annotation_features",
+                    side_effect=lambda frame: pd.DataFrame({
+                        "test_feature": np.zeros(len(frame))
+                    }),
+                ),
+                mock.patch.object(workflow, "_load_module", side_effect=fake_loader),
+            ):
+                report = workflow.run_full_corpus_test(
+                    corpus,
+                    model,
+                    [training_csv],
+                    ground_truth,
+                    root / "Variants.csv",
+                    root / "full-report.json",
+                    batch_size=2,
+                )
+                no_truth = workflow.run_full_corpus_test(
+                    corpus,
+                    model,
+                    [training_csv],
+                    None,
+                    root / "Variants-no-truth.csv",
+                    root / "no-truth-report.json",
+                    batch_size=2,
+                )
+
+            self.assertEqual(model.read_bytes(), b"frozen model bytes")
+            self.assertEqual(report["total_corpus_tokens"], sum(frequencies.values()))
+            self.assertEqual(report["total_unique_words"], len(frequencies))
+            self.assertEqual(report["total_generated_candidate_pairs"], 4)
+            self.assertEqual(report["total_classified_candidate_pairs"], 4)
+            self.assertEqual(report["total_predicted_spelling_variants"], 2)
+            self.assertEqual(report["total_predicted_non_variants"], 2)
+            self.assertEqual(report["total_greedy_resolved_variants"], 2)
+            self.assertEqual(report["training_pairs_excluded_from_independent_metrics"], 2)
+            self.assertEqual(report["ground_truth_pairs_excluded_for_training_overlap"], 2)
+            self.assertEqual(report["ground_truth_pairs_in_generated_candidates"], 2)
+            self.assertEqual(report["ground_truth_coverage"], 2 / 3)
+            self.assertEqual(report["confusion_matrix"], [[1, 0], [1, 1]])
+            self.assertAlmostEqual(report["accuracy"], 2 / 3)
+            self.assertEqual(report["status"], "FAIL")
+            self.assertIsNone(no_truth["accuracy"])
+            self.assertIsNone(no_truth["confusion_matrix"])
+            self.assertEqual(no_truth["status"], "INCOMPLETE")
+            exported = pd.read_csv(root / "Variants.csv")
+            self.assertEqual(
+                list(exported.columns),
+                [
+                    "word1", "word2", "word1_count", "word2_count",
+                    "character_difference",
+                ],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

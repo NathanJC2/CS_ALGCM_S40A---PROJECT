@@ -3,9 +3,16 @@
 from __future__ import annotations
 
 import argparse
+import sqlite3
+import tempfile
 from collections import defaultdict
 from itertools import islice, product
-from typing import Iterable, Sequence
+from pathlib import Path
+from typing import Iterable, Iterator, Protocol, Sequence
+
+
+class _PairSink(Protocol):
+    def add(self, pair: tuple[str, str]) -> None: ...
 
 
 def _signatures(word: str) -> frozenset[str]:
@@ -38,7 +45,7 @@ def _signature_index(words: Sequence[str]) -> dict[str, list[str]]:
 def _add_cross_pairs(
     left: dict[str, list[str]],
     right: dict[str, list[str]],
-    output: set[tuple[str, str]],
+    output: _PairSink,
     max_pairs_per_signature: int,
 ) -> None:
     for signature in left.keys() & right.keys():
@@ -127,6 +134,123 @@ def generate_candidates(
             _add_cross_pairs(left, right, cross_output, max_pairs_per_signature)
             output.update(cross_output)
     return sorted(output)
+
+
+class _CandidateSpool:
+    def __init__(self, connection: sqlite3.Connection, batch_size: int) -> None:
+        self.connection = connection
+        self.batch_size = batch_size
+        self.pending: set[tuple[str, str]] = set()
+
+    def add(self, pair: tuple[str, str]) -> None:
+        self.pending.add(tuple(sorted(pair)))
+        if len(self.pending) >= self.batch_size:
+            self.flush()
+
+    def flush(self) -> None:
+        if not self.pending:
+            return
+        self.connection.executemany(
+            "INSERT OR IGNORE INTO candidates(word1, word2) VALUES (?, ?)",
+            self.pending,
+        )
+        self.pending.clear()
+
+
+def _divide_index(
+    words: Sequence[str],
+    leaf_size: int,
+) -> dict[str, list[str]]:
+    """Build D&C signature indexes without retaining any pair products."""
+    if len(words) <= leaf_size:
+        return _signature_index(words)
+    midpoint = len(words) // 2
+    left = _divide_index(words[:midpoint], leaf_size)
+    right = _divide_index(words[midpoint:], leaf_size)
+    merged: dict[str, list[str]] = defaultdict(list)
+    for index in (left, right):
+        for signature, values in index.items():
+            merged[signature].extend(values)
+    return merged
+
+
+def iter_candidate_batches(
+    vocabulary: Iterable[str],
+    batch_size: int = 4096,
+    max_length_diff: int = 1,
+    leaf_size: int = 64,
+    max_pairs_per_signature: int = 5000,
+) -> Iterator[list[tuple[str, str]]]:
+    """Yield every D&C-blocked pair in bounded batches, deduplicating on disk.
+
+    The per-signature cap matches ``generate_candidates``; there is no global
+    candidate-pair limit. The temporary SQLite spool prevents the full pair set
+    from accumulating in Python memory.
+    """
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive.")
+    if max_length_diff < 0 or leaf_size < 1 or max_pairs_per_signature < 1:
+        raise ValueError("Blocking limits must be positive (length difference may be zero).")
+    words = sorted(set(vocabulary))
+    if not words:
+        return
+
+    buckets: dict[int, list[str]] = defaultdict(list)
+    for word in words:
+        buckets[len(word)].append(word)
+    lengths = sorted(buckets)
+
+    with tempfile.TemporaryDirectory(prefix="spelling_candidates_") as temp_dir:
+        connection = sqlite3.connect(str(Path(temp_dir) / "candidate_pairs.sqlite3"))
+        try:
+            connection.execute("PRAGMA journal_mode = OFF")
+            connection.execute("PRAGMA synchronous = OFF")
+            connection.execute(
+                "CREATE TABLE candidates ("
+                "word1 TEXT NOT NULL, word2 TEXT NOT NULL, "
+                "PRIMARY KEY (word1, word2)) WITHOUT ROWID"
+            )
+            spool = _CandidateSpool(connection, batch_size)
+            signature_index = _signature_index(words)
+            for posting in signature_index.values():
+                if len(posting) < 2:
+                    continue
+                ordered = sorted(set(posting))
+                for position, word1 in enumerate(ordered):
+                    for word2 in ordered[
+                        position + 1:position + 1 + max_pairs_per_signature
+                    ]:
+                        if abs(len(word1) - len(word2)) <= max_length_diff:
+                            spool.add((word1, word2))
+
+            del signature_index
+            bucket_indexes = {
+                length: _divide_index(buckets[length], leaf_size)
+                for length in lengths
+            }
+            for position, length in enumerate(lengths):
+                for other_length in lengths[position + 1:]:
+                    if other_length - length > max_length_diff:
+                        break
+                    _add_cross_pairs(
+                        bucket_indexes[length],
+                        bucket_indexes[other_length],
+                        spool,
+                        max_pairs_per_signature,
+                    )
+
+            spool.flush()
+            connection.commit()
+            cursor = connection.execute(
+                "SELECT word1, word2 FROM candidates ORDER BY word1, word2"
+            )
+            while True:
+                rows = cursor.fetchmany(batch_size)
+                if not rows:
+                    break
+                yield [(str(word1), str(word2)) for word1, word2 in rows]
+        finally:
+            connection.close()
 
 
 def main() -> int:

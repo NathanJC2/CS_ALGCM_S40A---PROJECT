@@ -1572,6 +1572,376 @@ def run_full_pipeline(
     return result
 
 
+def _read_verified_pair_labels(
+    csv_path: str | Path,
+) -> tuple[dict[tuple[str, str], int], int, int]:
+    frame = pd.read_csv(csv_path, keep_default_na=False)
+    required = {"word1", "word2", "is_variant"}
+    missing = required - set(frame.columns)
+    if missing:
+        raise ValueError(
+            f"Ground-truth CSV is missing columns: {sorted(missing)}"
+        )
+    labels: dict[tuple[str, str], int] = {}
+    unreviewed_rows = 0
+    for row in frame.itertuples(index=False):
+        pair = canonical_pair(str(row.word1), str(row.word2))
+        value = _normalize_label(row.is_variant)
+        if not value:
+            unreviewed_rows += 1
+            continue
+        label = int(value)
+        previous = labels.get(pair)
+        if previous is not None and previous != label:
+            raise ValueError(f"Conflicting ground-truth labels for pair {pair}")
+        labels[pair] = label
+    return labels, len(frame), unreviewed_rows
+
+
+def _full_test_training_exclusions(
+    artifact: Mapping[str, object],
+    annotation_paths: Sequence[str | Path],
+) -> tuple[set[tuple[str, str]], set[str]]:
+    missing = [str(path) for path in annotation_paths if not Path(path).is_file()]
+    if missing:
+        raise FileNotFoundError(f"Training annotation file(s) not found: {', '.join(missing)}")
+    sources = _annotation_source_paths(artifact, annotation_paths)
+    training_pairs = _training_pair_set(artifact)
+    for path in sources:
+        labels, _, _ = _read_verified_pair_labels(path)
+        training_pairs.update(labels)
+    if not training_pairs:
+        raise ValueError(
+            "Cannot exclude training pairs: provide annotations with verified "
+            "word1, word2, and is_variant labels."
+        )
+    training_words = {word for pair in training_pairs for word in pair}
+    return training_pairs, training_words
+
+
+def run_full_corpus_test(
+    corpus_path: str | Path,
+    model_path: str | Path,
+    annotation_paths: Sequence[str | Path],
+    ground_truth_path: str | Path | None = None,
+    output_csv: str | Path = "Variants.csv",
+    report_path: str | Path = "Full_Corpus_Test.json",
+    batch_size: int = 2048,
+    max_length_diff: int = 1,
+    leaf_size: int = 64,
+    max_pairs_per_signature: int = 5000,
+    encoding: str = "utf-8",
+) -> dict[str, object]:
+    """Run uncapped full-corpus D&C inference with batched features and optional truth."""
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive.")
+    protected_paths = {
+        Path(corpus_path).resolve(),
+        Path(model_path).resolve(),
+        *(Path(path).resolve() for path in annotation_paths),
+    }
+    if ground_truth_path is not None:
+        protected_paths.add(Path(ground_truth_path).resolve())
+    protected_paths.update(
+        (ROOT / name).resolve()
+        for name in (
+            "Evaluation.xlsx",
+            "Final_Evaluation.json",
+            "Final_Evaluation.txt",
+            "Test_Dataset.csv",
+            "Test_Dataset.csv.metadata.json",
+            "annotation_candidates.csv",
+            "annotations_final.csv",
+            "annotations_merged.csv",
+            "active_learning_candidates.csv",
+        )
+    )
+    if Path(output_csv).resolve() == Path(report_path).resolve():
+        raise ValueError("The CSV output and JSON report must use different paths.")
+    if Path(output_csv).resolve() in protected_paths:
+        raise ValueError(
+            "The output CSV cannot overwrite the corpus, model, annotations, "
+            "or existing evaluation files."
+        )
+    if Path(report_path).resolve() in protected_paths:
+        raise ValueError(
+            "The report cannot overwrite the corpus, model, annotations, "
+            "or existing evaluation files."
+        )
+
+    started = time.perf_counter()
+    model_digest = _sha256_file(model_path)
+    artifact = _load_variant_artifact(model_path)
+    training_pairs, training_words = _full_test_training_exclusions(
+        artifact, annotation_paths
+    )
+    frequencies = corpus_counts(corpus_path, encoding=encoding)
+    vocabulary = sorted(frequencies)
+    corpus_tokens = sum(frequencies.values())
+
+    language_predictions = _predict_languages(
+        vocabulary, corpus_path, batch_size=min(batch_size, 1000)
+    )
+    context_profiles, _ = _collect_pair_contexts(
+        corpus_path,
+        ((word, word) for word in vocabulary),
+        encoding=encoding,
+        max_examples=0,
+    )
+
+    ground_truth_input: dict[tuple[str, str], int] = {}
+    ground_truth_rows = 0
+    unreviewed_ground_truth_rows = 0
+    if ground_truth_path is not None:
+        ground_truth_input, ground_truth_rows, unreviewed_ground_truth_rows = (
+            _read_verified_pair_labels(ground_truth_path)
+        )
+    outside_corpus_ground_truth = {
+        pair for pair in ground_truth_input
+        if pair[0] not in frequencies or pair[1] not in frequencies
+    }
+    excluded_ground_truth = {
+        pair for pair in ground_truth_input
+        if pair not in outside_corpus_ground_truth and (
+            pair in training_pairs
+            or pair[0] in training_words
+            or pair[1] in training_words
+        )
+    }
+    ground_truth = {
+        pair: label for pair, label in ground_truth_input.items()
+        if pair not in excluded_ground_truth
+        and pair not in outside_corpus_ground_truth
+    }
+
+    blocker = _load_module("02_candidate_blocking_dnc.py", "full_corpus_dnc")
+    edit_module = _load_module("03_dp_edit_distance.py", "full_corpus_dp")
+    classifier = artifact["classifier"]
+    feature_columns = list(artifact.get("feature_columns", ()))
+    if not feature_columns:
+        raise ValueError("The spelling model does not contain its feature column order.")
+    positive_class_index = list(classifier.classes_).index(1)
+    threshold = float(artifact["threshold"])
+    generated_pairs = 0
+    classified_pairs = 0
+    classifier_positive = 0
+    classifier_negative = 0
+    exact_training_overlap = 0
+    lexical_training_overlap = 0
+    classified_training_overlap = 0
+    blocked_ground_truth: set[tuple[str, str]] = set()
+    classified_ground_truth: set[tuple[str, str]] = set()
+    selected_pairs: list[tuple[str, str, float]] = []
+
+    candidate_batches = blocker.iter_candidate_batches(
+        vocabulary,
+        batch_size=batch_size,
+        max_length_diff=max_length_diff,
+        leaf_size=leaf_size,
+        max_pairs_per_signature=max_pairs_per_signature,
+    )
+    for pairs in candidate_batches:
+        generated_pairs += len(pairs)
+        records: list[dict[str, object]] = []
+        for pair in pairs:
+            if pair in training_pairs:
+                exact_training_overlap += 1
+            elif pair[0] in training_words or pair[1] in training_words:
+                lexical_training_overlap += 1
+            if pair in ground_truth:
+                blocked_ground_truth.add(pair)
+            row = _pair_info(pair, {"dnc"}, frequencies, edit_module)
+            distance = int(row["edit_distance"])
+            denominator = max(1, len(pair[0]), len(pair[1]))
+            if distance > 4 or distance / denominator > 0.5:
+                continue
+            row["context_similarity"] = _context_cosine(
+                context_profiles.get(pair[0], {}),
+                context_profiles.get(pair[1], {}),
+            )
+            row["word1_language"] = language_predictions.get(pair[0], "OTH")
+            row["word2_language"] = language_predictions.get(pair[1], "OTH")
+            row["word1_context_examples"] = ""
+            row["word2_context_examples"] = ""
+            row["is_variant"] = ""
+            records.append(row)
+            if pair in ground_truth:
+                classified_ground_truth.add(pair)
+            if (
+                pair in training_pairs
+                or pair[0] in training_words
+                or pair[1] in training_words
+            ):
+                classified_training_overlap += 1
+        if not records:
+            continue
+
+        frame = pd.DataFrame(records)
+        features = annotation_features(frame)
+        missing_features = set(feature_columns) - set(features.columns)
+        if missing_features:
+            raise ValueError(
+                f"Feature extractor is missing model columns: {sorted(missing_features)}"
+            )
+        probabilities = classifier.predict_proba(
+            features[feature_columns]
+        )[:, positive_class_index]
+        predictions = probabilities >= threshold
+        positive_count = int(np.count_nonzero(predictions))
+        classifier_positive += positive_count
+        classifier_negative += len(records) - positive_count
+        classified_pairs += len(records)
+        selected_pairs.extend(
+            (str(row["word1"]), str(row["word2"]), float(probability))
+            for row, probability, predicted in zip(
+                records, probabilities, predictions
+            )
+            if predicted
+        )
+
+    resolver = _load_module("07_greedy_cluster_resolver.py", "full_corpus_resolver")
+    resolved = resolver.resolve_variant_pairs(
+        selected_pairs,
+        minimum_confidence=threshold,
+        cohesion_threshold=threshold,
+    )
+    resolved_pairs = {
+        canonical_pair(str(word1), str(word2))
+        for word1, word2, _ in resolved
+    }
+    exporter = _load_module("08_export_variants_csv.py", "full_corpus_exporter")
+    exported_pairs = exporter.export_variants(
+        resolved, dict(frequencies), output_csv
+    )
+
+    if ground_truth_path is not None and ground_truth:
+        true_labels = [ground_truth[pair] for pair in sorted(ground_truth)]
+        predicted_labels = [
+            int(pair in resolved_pairs) for pair in sorted(ground_truth)
+        ]
+        accuracy = float(accuracy_score(true_labels, predicted_labels))
+        precision = float(precision_score(true_labels, predicted_labels, zero_division=0))
+        recall = float(recall_score(true_labels, predicted_labels, zero_division=0))
+        f1 = float(f1_score(true_labels, predicted_labels, zero_division=0))
+        balanced_accuracy = float(balanced_accuracy_score(true_labels, predicted_labels))
+        matrix = confusion_matrix(
+            true_labels, predicted_labels, labels=[0, 1]
+        ).tolist()
+    else:
+        accuracy = precision = recall = f1 = balanced_accuracy = None
+        matrix = None
+
+    eligible_ground_truth_count = len(ground_truth)
+    ground_truth_coverage = (
+        len(blocked_ground_truth) / eligible_ground_truth_count
+        if eligible_ground_truth_count else None
+    )
+    complete_ground_truth = (
+        ground_truth_path is not None
+        and eligible_ground_truth_count > 0
+        and unreviewed_ground_truth_rows == 0
+    )
+    status = (
+        "INCOMPLETE" if not complete_ground_truth or accuracy is None
+        else "PASS" if accuracy > REQUIRED_ACCURACY
+        else "FAIL"
+    )
+    if _sha256_file(model_path) != model_digest:
+        raise RuntimeError("The trained model changed during full-corpus testing.")
+
+    result: dict[str, object] = {
+        "status": status,
+        "input_corpus": str(corpus_path),
+        "model": str(model_path),
+        "model_sha256": model_digest,
+        "classification_threshold": threshold,
+        "total_corpus_tokens": corpus_tokens,
+        "total_unique_words": len(vocabulary),
+        "total_generated_candidate_pairs": generated_pairs,
+        "total_classified_candidate_pairs": classified_pairs,
+        "total_predicted_spelling_variants": classifier_positive,
+        "total_predicted_non_variants": classifier_negative,
+        "total_greedy_resolved_variants": len(resolved),
+        "total_exported_variant_pairs": exported_pairs,
+        "total_verified_ground_truth_pairs": eligible_ground_truth_count,
+        "ground_truth_input_rows": ground_truth_rows,
+        "unreviewed_ground_truth_rows": unreviewed_ground_truth_rows,
+        "ground_truth_pairs_excluded_for_training_overlap": len(excluded_ground_truth),
+        "ground_truth_pairs_outside_corpus": len(outside_corpus_ground_truth),
+        "ground_truth_pairs_in_generated_candidates": len(blocked_ground_truth),
+        "ground_truth_pairs_classified": len(classified_ground_truth),
+        "ground_truth_coverage": ground_truth_coverage,
+        "ground_truth_classified_coverage": (
+            len(classified_ground_truth) / eligible_ground_truth_count
+            if eligible_ground_truth_count else None
+        ),
+        "training_pairs_excluded_from_independent_metrics": classified_training_overlap,
+        "training_exact_pair_candidate_overlaps": exact_training_overlap,
+        "training_lexical_group_candidate_overlaps": lexical_training_overlap,
+        "accuracy": accuracy,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "balanced_accuracy": balanced_accuracy,
+        "confusion_matrix": matrix,
+        "required_accuracy_strictly_greater_than": REQUIRED_ACCURACY,
+        "evaluation_prediction_stage": (
+            "Greedy-resolved output; verified reference pairs missed by blocking "
+            "or edit-distance filtering count as predicted non-variants."
+        ),
+        "candidate_blocking_scope": (
+            "All pairs emitted by Divide-and-Conquer signature blocking; "
+            "no global candidate-pair cap or random sampling."
+        ),
+        "batch_size": batch_size,
+        "max_pairs_per_signature": max_pairs_per_signature,
+        "output_csv": str(output_csv),
+        "total_execution_time_seconds": time.perf_counter() - started,
+    }
+    report_target = Path(report_path)
+    report_target.parent.mkdir(parents=True, exist_ok=True)
+    report_target.write_text(
+        json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False),
+        encoding="utf-8",
+    )
+
+    def percent(value: object) -> str:
+        return "N/A" if value is None else f"{100 * float(value):.2f}%"
+
+    print("========== FULL CORPUS TEST ==========")
+    print(f"Input corpus: {corpus_path}")
+    print(f"Total corpus tokens: {corpus_tokens}")
+    print(f"Total unique words: {len(vocabulary)}")
+    print(f"Total generated candidate pairs: {generated_pairs}")
+    print(f"Total classified candidate pairs: {classified_pairs}")
+    print(f"Total predicted spelling variants: {classifier_positive}")
+    print(f"Total predicted non-variants: {classifier_negative}")
+    print(f"Total Greedy-resolved variants: {len(resolved)}")
+    print(f"Total verified ground-truth pairs: {eligible_ground_truth_count}")
+    print(f"Ground-truth pairs excluded for training overlap: {len(excluded_ground_truth)}")
+    print(f"Ground-truth pairs outside corpus: {len(outside_corpus_ground_truth)}")
+    print(f"Training-overlap candidates excluded from metrics: {classified_training_overlap}")
+    print(
+        "Ground-truth coverage: "
+        f"{percent(ground_truth_coverage)} "
+        f"({len(blocked_ground_truth)}/{eligible_ground_truth_count} reference pairs)"
+    )
+    print(f"Accuracy: {percent(accuracy)}")
+    print(f"Precision: {percent(precision)}")
+    print(f"Recall: {percent(recall)}")
+    print(f"F1-score: {percent(f1)}")
+    print(f"Balanced accuracy: {percent(balanced_accuracy)}")
+    print("Confusion matrix:")
+    print(matrix if matrix is not None else "N/A (no verified independent ground truth)")
+    print("Required accuracy: >70%")
+    print(f"Result: {status}")
+    print(f"Total execution time: {result['total_execution_time_seconds']:.2f} seconds")
+    print(f"Variants CSV: {output_csv}")
+    print(f"Full test report: {report_target}")
+    print("=======================================")
+    return result
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -1642,6 +2012,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     test.add_argument("--json-output", default="Final_Evaluation.json")
     test.add_argument("--text-output", default="Final_Evaluation.txt")
 
+    full_test = commands.add_parser(
+        "test-full",
+        help="Run batched full-corpus inference with optional verified ground truth",
+    )
+    full_test.add_argument("--corpus", default="Raw.txt")
+    full_test.add_argument("--model", default="variant_classifier.pkl")
+    full_test.add_argument("--annotations", nargs="+", required=True)
+    full_test.add_argument("--ground-truth")
+    full_test.add_argument("--output-csv", default="Variants.csv")
+    full_test.add_argument("--report", default="Full_Corpus_Test.json")
+    full_test.add_argument("--batch-size", type=int, default=2048)
+    full_test.add_argument("--max-length-diff", type=int, default=1)
+    full_test.add_argument("--leaf-size", type=int, default=64)
+    full_test.add_argument("--max-pairs-per-signature", type=int, default=5000)
+    full_test.add_argument("--encoding", default="utf-8")
+
     args = parser.parse_args(argv)
     if args.command == "generate":
         generate_annotation_candidates(
@@ -1683,6 +2069,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         evaluate_independent_test(
             args.corpus, args.model, args.test_data, args.annotations,
             args.json_output, args.text_output,
+        )
+    elif args.command == "test-full":
+        run_full_corpus_test(
+            args.corpus,
+            args.model,
+            args.annotations,
+            args.ground_truth,
+            args.output_csv,
+            args.report,
+            args.batch_size,
+            args.max_length_diff,
+            args.leaf_size,
+            args.max_pairs_per_signature,
+            args.encoding,
         )
     return 0
 
